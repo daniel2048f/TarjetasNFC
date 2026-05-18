@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\Daniel Alejandro\\\\Documents\\\\PlatformIO\\\\Projects\\\\TarjetasNFC\" -Force)",
+      "Bash(Select-Object Name, Mode)",
+      "Bash(Format-Table -AutoSize)",
+      "PowerShell(Get-ChildItem -Path \"c:\\\\Users\\\\Daniel Alejandro\\\\Documents\\\\PlatformIO\\\\Projects\\\\TarjetasNFC\" -Name -Force | Where-Object {$_ -match \"README|Makefile|\\\\.cursorrules|CLAUDE\"})",
+      "PowerShell(Get-ChildItem -Path \"c:\\\\Users\\\\Daniel Alejandro\\\\Documents\\\\PlatformIO\\\\Projects\\\\TarjetasNFC\" -Recurse | Where-Object {$_.Extension -match \"\\\\.\\(cpp|h|ino\\)$\"} | Select-Object FullName)"
+    ]
+  }
+}
