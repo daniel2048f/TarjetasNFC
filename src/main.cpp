@@ -4,26 +4,29 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <Wire.h>
-#include <LittleFS.h>           // sistema de archivos en flash para los logs
+#include <LittleFS.h>
 #include <Adafruit_PN532.h>
+#include <LiquidCrystal_I2C.h>
 
-// I2C: busRtc(SDA=19,SCL=18)→RTC SD3078 | Wire(SDA=21,SCL=22)→PN532
+// I2C: busRtc(SDA=19,SCL=18)→RTC SD3078 | Wire(SDA=21,SCL=22)→PN532+LCD(0x27)
 #define RTC_SDA        19
 #define RTC_SCL        18
 #define RTC_DIRECCION  0x32
 #define REG_FIRMA1     0x2C
 #define REG_FIRMA2     0x2D
-#define ARCHIVO_LOG    "/logs.txt"  // logs en LittleFS (~1-3 MB disponibles)
+#define ARCHIVO_LOG    "/logs.txt"
 
-TwoWire          busRtc = TwoWire(1);
-Adafruit_PN532   lectorNfc(21, 22);
+TwoWire           busRtc = TwoWire(1);
+Adafruit_PN532    lectorNfc(21, 22);
+LiquidCrystal_I2C lcd(0x27, 20, 4);
 
 const char* SSID_AP  = "NFC";
 const char* CLAVE_AP = "12345678";
 WebServer   servidor(80);
-Preferences almacen;  // solo guarda usuarios (uid→nombre) y claves de estado
+Preferences almacen;
 
 String nombrePendiente      = "";
+String codigoPendiente      = "";
 bool   esperandoTarjeta     = false;
 bool   modoEliminar         = false;
 bool   resultadoEliminacion = false;
@@ -35,6 +38,41 @@ unsigned long ultimoChequeoLimpieza = 0;
 const unsigned long INTERVALO_NFC      = 300;
 const unsigned long INTERVALO_LIMPIEZA = 60000;
 bool rtcDisponible = false;
+
+// Timer no bloqueante para volver al mensaje idle tras mostrar un nombre
+unsigned long tiempoLcdHasta = 0;
+enum LcdPost { LCD_IDLE, LCD_LISTO };
+LcdPost lcdPost = LCD_IDLE;
+
+// ── LCD ──────────────────────────────────────────────────────
+void lcdMostrar(String l1, String l2, String l3, String l4) {
+  lcd.clear();
+  String ls[4] = { l1, l2, l3, l4 };
+  for (int i = 0; i < 4; i++) {
+    lcd.setCursor(0, i);
+    if (ls[i].length() > 20) ls[i] = ls[i].substring(0, 20);
+    lcd.print(ls[i]);
+  }
+}
+
+void lcdMostrarNombre(String nombreCompleto, String codigo) {
+  String tok[4] = {"", "", "", ""};
+  int n = 0, ini = 0;
+  for (int i = 0; i <= (int)nombreCompleto.length() && n < 4; i++) {
+    if (i == (int)nombreCompleto.length() || nombreCompleto[i] == ' ') {
+      if (i > ini) tok[n++] = nombreCompleto.substring(ini, i);
+      ini = i + 1;
+    }
+  }
+  // Línea 4: token[3] relleno hasta col 14, código alineado a la derecha en cols 14-19
+  String linea4 = tok[3].substring(0, min((int)tok[3].length(), 14));
+  while ((int)linea4.length() < 14) linea4 += ' ';
+  codigo = codigo.substring(0, min((int)codigo.length(), 6));
+  String codAli = "";
+  for (int i = (int)codigo.length(); i < 6; i++) codAli += ' ';
+  codAli += codigo;
+  lcdMostrar(tok[0], tok[1], tok[2], linea4 + codAli);
+}
 
 // ── RTC ──────────────────────────────────────────────────────
 int bcd2bin(int v) { return (v >> 4) * 10 + (v & 0xF); }
@@ -139,18 +177,26 @@ String pagina(const String& titulo, const String& cuerpo) {
 }
 
 // ── Logs (LittleFS) ──────────────────────────────────────────
-void logAgregar(const String& ts, const String& uid, const String& nombre) {
-  // "a" = append: agrega al final del archivo sin borrar lo anterior
+void logAgregar(const String& ts, const String& uid, const String& nombre, const String& codigo) {
   File f = LittleFS.open(ARCHIVO_LOG, "a");
-  if (f) { f.println(ts + "|" + uid + "|" + nombre); f.close(); }
+  if (f) { f.println(ts + "|" + uid + "|" + nombre + "|" + codigo); f.close(); }
 }
 
-// Separa una entrada "timestamp|uid|nombre" en sus tres partes.
-// Retorna false si el formato no es válido (protección ante entradas corruptas).
-bool logParsear(const String& entrada, String &ts, String &uid, String &nombre) {
+// Parsea "timestamp|uid|nombre|codigo". El 4to campo es opcional para compatibilidad
+// con logs viejos que solo tienen 3 campos.
+bool logParsear(const String& entrada, String &ts, String &uid, String &nombre, String &codigo) {
   int pos1 = entrada.indexOf('|'), pos2 = entrada.indexOf('|', pos1 + 1);
   if (pos1 < 0 || pos2 < 0) return false;
-  ts = entrada.substring(0, pos1); uid = entrada.substring(pos1+1, pos2); nombre = entrada.substring(pos2+1);
+  ts  = entrada.substring(0, pos1);
+  uid = entrada.substring(pos1+1, pos2);
+  int pos3 = entrada.indexOf('|', pos2 + 1);
+  if (pos3 < 0) {
+    nombre = entrada.substring(pos2+1);
+    codigo = "";
+  } else {
+    nombre = entrada.substring(pos2+1, pos3);
+    codigo = entrada.substring(pos3+1);
+  }
   return true;
 }
 
@@ -167,7 +213,7 @@ String logHtml() {
   // Segunda pasada: cargar en memoria solo las últimas 300 entradas para no
   // saturar la RAM del ESP32. new/delete[] reserva y libera el arreglo en heap.
   int mostrar = min(total, 300);
-  int saltar  = total - mostrar;  // si hay más de 300, ignorar las más antiguas
+  int saltar  = total - mostrar;
   String* buf = new String[mostrar];
   int n = 0, fila = 0;
   while (f.available()) {
@@ -182,9 +228,11 @@ String logHtml() {
   if (total > 300) resultado += " (mostrando los ultimos 300)";
   resultado += "</div><hr>";
   for (int i = n - 1; i >= 0; i--) {  // recorrido inverso: más reciente primero
-    String ts, uid, nombre;
-    if (!logParsear(buf[i], ts, uid, nombre)) continue;
-    resultado += "<div><b>" + nombre + "</b> <span class='muted'>(UID: " + uid + ")</span><br>"
+    String ts, uid, nombre, codigo;
+    if (!logParsear(buf[i], ts, uid, nombre, codigo)) continue;
+    resultado += "<div><b>" + nombre + "</b>";
+    if (codigo.length()) resultado += " <span class='muted'>[" + codigo + "]</span>";
+    resultado += " <span class='muted'>(UID: " + uid + ")</span><br>"
                  "<span class='ts'>&#128336; " + ts + "</span></div><hr>";
   }
   delete[] buf;  // liberar el arreglo de la memoria heap
@@ -192,7 +240,6 @@ String logHtml() {
 }
 
 String logTexto() {
-  // Lee el archivo completo línea por línea sin cargarlo entero en RAM
   File f = LittleFS.open(ARCHIVO_LOG, "r");
   if (!f || !f.size()) return "Sin registros.\n";
   String resultado = "=== REGISTRO DE ACCESOS ===\nGenerado: " +
@@ -201,10 +248,12 @@ String logTexto() {
   while (f.available()) {
     String l = f.readStringUntil('\n'); l.trim();
     if (!l.length()) continue;
-    String ts, uid, nombre;
-    if (!logParsear(l, ts, uid, nombre)) continue;
+    String ts, uid, nombre, codigo;
+    if (!logParsear(l, ts, uid, nombre, codigo)) continue;
     char linea[8]; snprintf(linea, sizeof(linea), "%4d. ", n++);
-    resultado += String(linea) + ts + "   " + nombre + "   (UID: " + uid + ")\n";
+    resultado += String(linea) + ts + "   " + nombre;
+    if (codigo.length()) resultado += " [" + codigo + "]";
+    resultado += "   (UID: " + uid + ")\n";
   }
   f.close();
   return resultado + "\nFin del registro.\n";
@@ -216,7 +265,7 @@ void autoLimpiarLogs() {
   busRtc.beginTransmission(RTC_DIRECCION); busRtc.write(0x00);
   busRtc.endTransmission(false); busRtc.requestFrom(RTC_DIRECCION, 7);
   busRtc.read(); busRtc.read();              // seg, min (no se necesitan)
-  int hora = bcd2bin(busRtc.read() & 0x3F); // hora actual
+  int hora = bcd2bin(busRtc.read() & 0x3F);
   busRtc.read();                             // día de semana, se descarta
   int dia  = bcd2bin(busRtc.read() & 0x3F);
   int mes  = bcd2bin(busRtc.read() & 0x1F);
@@ -234,7 +283,7 @@ void autoLimpiarLogs() {
   char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", anio, mes, dia);
   if (almacen.getString("lastClean", "") == String(hoy)) return;
 
-  LittleFS.remove(ARCHIVO_LOG);  // borrar el archivo completo de logs
+  LittleFS.remove(ARCHIVO_LOG);
   almacen.putString("lastClean", String(hoy));
   Serial.println("AUTO-LIMPIEZA: " + String(hoy));
 }
@@ -264,6 +313,8 @@ void handleRegisterForm() {
     "<h2>Registrar usuario</h2><div class='card'>"
     "<form method='POST' action='/saveName'>"
     "<label>Nombre:</label><br><input name='name' placeholder='Ej: Juan Perez' required>"
+    "<br><br><label>Codigo:</label><br>"
+    "<input name='code' maxlength='6' pattern='[A-Za-z0-9]{1,6}' required placeholder='Ej: AB1234'>"
     "<br><br><button type='submit'>Guardar</button></form>"
     "<p class='muted'>Despues de guardar, acerca la tarjeta al lector.</p></div>"
     "<div class='card' style='border-color:#dc3545'>"
@@ -272,13 +323,21 @@ void handleRegisterForm() {
     "<a href='/'><button>Volver</button></a>"));
 }
 void handleSaveName() {
-  if (!servidor.hasArg("name")) { servidor.send(400, "text/plain", "Falta 'name'"); return; }
+  if (!servidor.hasArg("name") || !servidor.hasArg("code")) {
+    servidor.send(400, "text/plain", "Faltan campos"); return;
+  }
   nombrePendiente = servidor.arg("name"); nombrePendiente.trim();
+  codigoPendiente = servidor.arg("code"); codigoPendiente.trim();
   if (!nombrePendiente.length()) { servidor.send(400, "text/plain", "Nombre vacio"); return; }
+  if (!codigoPendiente.length() || codigoPendiente.length() > 6) {
+    servidor.send(400, "text/plain", "Codigo invalido (1-6 caracteres)"); return;
+  }
   esperandoTarjeta = true; modoEliminar = false;
+  lcdMostrar("Registrando:", nombrePendiente, "Acerca tarjeta", "");
   servidor.send(200, "text/html", pagina("Acerca la tarjeta",
     "<h2>Acerca la tarjeta</h2><div class='card'>"
     "<p>Nombre: <b>" + nombrePendiente + "</b></p>"
+    "<p>Codigo: <b>" + codigoPendiente + "</b></p>"
     "<p id='st'>Esperando...</p>"
     // Polling cada 700ms a /status; cuando recibe "OK|..." redirige a /done
     "<script>setInterval(async()=>{let t=await(await fetch('/status')).text();"
@@ -287,7 +346,8 @@ void handleSaveName() {
     "<a href='/cancelar'><button>Cancelar</button></a></div>"));
 }
 void handleDeleteUser() {
-  esperandoTarjeta = false; modoEliminar = true; nombrePendiente = "";
+  esperandoTarjeta = false; modoEliminar = true; nombrePendiente = ""; codigoPendiente = "";
+  lcdMostrar("Modo eliminar", "Acerca tarjeta", "", "");
   servidor.send(200, "text/html", pagina("Borrar usuario",
     "<h2>Borrar usuario</h2><div class='card' style='border-color:#dc3545'>"
     "<p style='color:#dc3545;font-weight:bold'>&#9888; Acerca la tarjeta para BORRAR</p>"
@@ -318,10 +378,15 @@ void handleDone() {
   String datos  = servidor.hasArg("d") ? servidor.arg("d") : "";
   String cuerpo = "<h2>&#10003; Registrado</h2><div class='card'>";
   if (datos.startsWith("OK|")) {
-    int pos1 = datos.indexOf('|'), pos2 = datos.indexOf('|', pos1+1), pos3 = datos.indexOf('|', pos2+1);
+    // Formato: OK|uid|nombre|codigo|timestamp
+    int pos1 = datos.indexOf('|'),
+        pos2 = datos.indexOf('|', pos1+1),
+        pos3 = datos.indexOf('|', pos2+1),
+        pos4 = (pos3 > 0) ? datos.indexOf('|', pos3+1) : -1;
     cuerpo += "<p>UID: <b>" + datos.substring(pos1+1, pos2) + "</b></p>"
               "<p>Nombre: <b>" + datos.substring(pos2+1, pos3>0 ? pos3 : datos.length()) + "</b></p>";
-    if (pos3 > 0) cuerpo += "<p class='ts'>&#128336; " + datos.substring(pos3+1) + "</p>";
+    if (pos3 > 0) cuerpo += "<p>Codigo: <b>" + datos.substring(pos3+1, pos4>0 ? pos4 : datos.length()) + "</b></p>";
+    if (pos4 > 0) cuerpo += "<p class='ts'>&#128336; " + datos.substring(pos4+1) + "</p>";
   } else cuerpo += "<p class='muted'>Sin datos.</p>";
   cuerpo += "<a href='/'><button>Inicio</button></a> <a href='/logs'><button>Ver logs</button></a></div>";
   servidor.send(200, "text/html", pagina("Registrado", cuerpo));
@@ -330,10 +395,14 @@ void handleDeleted() {
   String datos  = servidor.hasArg("d") ? servidor.arg("d") : "";
   String cuerpo = "<h2>Usuario borrado</h2><div class='card'>";
   if (datos.startsWith("DELETED|")) {
-    int pos1 = datos.indexOf('|'), pos2 = datos.indexOf('|', pos1+1);
+    // Formato: DELETED|uid|nombre|codigo
+    int pos1 = datos.indexOf('|'),
+        pos2 = datos.indexOf('|', pos1+1),
+        pos3 = datos.indexOf('|', pos2+1);
     cuerpo += "<p style='color:#dc3545;font-weight:bold'>&#10003; Usuario eliminado</p>"
               "<p>UID: <b>" + datos.substring(pos1+1, pos2) + "</b></p>"
-              "<p>Nombre: <b>" + datos.substring(pos2+1) + "</b></p>";
+              "<p>Nombre: <b>" + datos.substring(pos2+1, pos3>0 ? pos3 : datos.length()) + "</b></p>";
+    if (pos3 > 0) cuerpo += "<p>Codigo: <b>" + datos.substring(pos3+1) + "</b></p>";
   } else if (datos.startsWith("NOT_FOUND|")) {
     cuerpo += "<p style='color:#ff9800;font-weight:bold'>&#9888; Tarjeta no registrada</p>"
               "<p>UID: <b>" + datos.substring(datos.indexOf('|')+1) + "</b></p>";
@@ -354,7 +423,7 @@ void handleClearLogs() {
   int total = 0;
   File f = LittleFS.open(ARCHIVO_LOG, "r");
   if (f) { while (f.available()) { if (f.read() == '\n') total++; } f.close(); }
-  LittleFS.remove(ARCHIVO_LOG);  // borrar el archivo completo
+  LittleFS.remove(ARCHIVO_LOG);
   servidor.send(200, "text/html", pagina("Logs borrados",
     "<h2>Logs borrados</h2><div class='card'>"
     "<p>&#10003; Eliminados <b>" + String(total) + "</b> eventos.</p>"
@@ -366,11 +435,12 @@ void handleDownloadLogs() {
   servidor.sendHeader("Content-Disposition", "attachment; filename=\"logs_" + ts + ".txt\"");
   servidor.send(200, "text/plain; charset=utf-8", logTexto());
 }
-
 void handleCancelar() {
   esperandoTarjeta = false;
   modoEliminar     = false;
   nombrePendiente  = "";
+  codigoPendiente  = "";
+  lcdMostrar("Cancelado", "", "", "");
   servidor.send(200, "text/html", pagina("Cancelado",
     "<h2>Operacion cancelada</h2><div class='card'>"
     "<p class='muted'>No se realizó ningun cambio.</p>"
@@ -400,7 +470,11 @@ bool leerUidUnaVez(String &uidSalida) {
 // ── Setup & Loop ─────────────────────────────────────────────
 void setup() {
   Serial.begin(115200); delay(500);
-  Wire.begin(21, 22);
+
+  Wire.begin(21, 22);  // debe inicializarse antes del LCD y el PN532
+
+  lcd.init(); lcd.backlight();
+  lcdMostrar("Sistema NFC", "Iniciando...", "", "");
   busRtc.begin(RTC_SDA, RTC_SCL); delay(50);
   busRtc.beginTransmission(RTC_DIRECCION);
   rtcDisponible = (busRtc.endTransmission() == 0);
@@ -433,14 +507,24 @@ void setup() {
   servidor.on("/logs",         handleLogs);
   servidor.on("/downloadLogs", handleDownloadLogs);
   servidor.on("/clearLogs",    handleClearLogs);
-  servidor.on("/cancelar", handleCancelar);
+  servidor.on("/cancelar",     handleCancelar);
   servidor.begin();
   Serial.println("Servidor web iniciado!");
+
+  lcdMostrar("Sistema NFC", "Listo...", "", "");
 }
 
 void loop() {
   servidor.handleClient();
   unsigned long ahora = millis();
+
+  // Cuando expira el timer del LCD, volver al mensaje correspondiente
+  if (tiempoLcdHasta && ahora >= tiempoLcdHasta) {
+    tiempoLcdHasta = 0;
+    if (lcdPost == LCD_IDLE) lcdMostrar("Esperando", "tarjeta...", "", "");
+    else                     lcdMostrar("Listo", "", "", "");
+  }
+
   if (ahora - ultimoChequeoLimpieza >= INTERVALO_LIMPIEZA) { ultimoChequeoLimpieza = ahora; autoLimpiarLogs(); }
   if (ahora - ultimaLecturaNfc < INTERVALO_NFC) return;
   ultimaLecturaNfc = ahora;
@@ -454,22 +538,41 @@ void loop() {
     if (!nombre.length()) {
       almacen.putString("lastDel", "NOT_FOUND|" + uid);
       Serial.println("TARJETA NO REGISTRADA: " + uid);
+      lcdMostrar("No registrado", "", "", "");
+      tiempoLcdHasta = millis() + 3000;
+      lcdPost = LCD_IDLE;
     } else {
+      String claveCode = "k" + uid;
+      String codigo = almacen.getString(claveCode.c_str(), "");
       almacen.remove(uid.c_str());
-      almacen.putString("lastDel", "DELETED|" + uid + "|" + nombre);
+      almacen.remove(claveCode.c_str());
+      almacen.putString("lastDel", "DELETED|" + uid + "|" + nombre + "|" + codigo);
       Serial.println("[" + ts + "] BORRADO: " + uid + " -> " + nombre);
+      lcdMostrarNombre(nombre, codigo);
+      tiempoLcdHasta = millis() + 3000;
+      lcdPost = LCD_LISTO;
     }
     resultadoEliminacion = true; modoEliminar = false; return;
   }
 
   if (esperandoTarjeta) {
+    String claveCode = "k" + uid;
     almacen.putString(uid.c_str(), nombrePendiente);
-    almacen.putString("lastReg", "OK|" + uid + "|" + nombrePendiente + "|" + ts);
-    Serial.println("[" + ts + "] REGISTRADO: " + uid + " -> " + nombrePendiente);
-    esperandoTarjeta = false; nombrePendiente = ""; return;
+    almacen.putString(claveCode.c_str(), codigoPendiente);
+    almacen.putString("lastReg", "OK|" + uid + "|" + nombrePendiente + "|" + codigoPendiente + "|" + ts);
+    Serial.println("[" + ts + "] REGISTRADO: " + uid + " -> " + nombrePendiente + " (" + codigoPendiente + ")");
+    lcdMostrarNombre(nombrePendiente, codigoPendiente);
+    tiempoLcdHasta = millis() + 4000;
+    lcdPost = LCD_LISTO;
+    esperandoTarjeta = false; codigoPendiente = ""; nombrePendiente = ""; return;
   }
 
   String nombre = almacen.getString(uid.c_str(), "NO_REGISTRADO");
-  logAgregar(ts, uid, nombre);
+  String claveCode = "k" + uid;
+  String codigo = almacen.getString(claveCode.c_str(), "");
+  logAgregar(ts, uid, nombre, codigo);
   Serial.println("[" + ts + "] LECTURA: " + uid + " -> " + nombre);
+  lcdMostrarNombre(nombre, codigo);
+  tiempoLcdHasta = millis() + 4000;
+  lcdPost = LCD_IDLE;
 }
