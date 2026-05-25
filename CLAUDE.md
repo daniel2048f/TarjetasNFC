@@ -29,50 +29,92 @@ ESP32-based NFC access control system. Reads NFC card UIDs via a PN532 reader, m
 
 ## Hardware
 
-| Bus            | Pins (SDA/SCL) | Device            |
-| -------------- | -------------- | ----------------- |
-| Wire (I2C 0)   | 21 / 22        | PN532 NFC reader  |
-| busRtc (I2C 1) | 19 / 18        | SD3078 RTC module |
+| Bus            | Pins (SDA/SCL) | Device                        |
+| -------------- | -------------- | ----------------------------- |
+| Wire (I2C 0)   | 21 / 22        | PN532 NFC reader + LCD (0x27) |
+| busRtc (I2C 1) | 19 / 18        | SD3078 RTC module             |
+
+LCD is a 20×4 `LiquidCrystal_I2C` at address `0x27`, sharing `Wire` with the PN532.
+
+**SD3078 battery quirk**: The write-protection registers (`0x0F`, `0x10`) and the oscillator-enable bit (EOSC) reset to 0 when main power is cut. On every boot, `rtcReiniciarRegistros()` re-reads the time values and rewrites them with the correct control bits (EOSC=1, 24H mode) so the oscillator keeps running on battery. On a new firmware build, `rtcAjustarHora()` is called instead via `rtcSincronizarSiNecesario()`.
 
 ## Architecture
 
-All logic lives in [src/main.cpp](src/main.cpp) (~475 lines). There are no header files or split modules.
+All logic lives in [src/main.cpp](src/main.cpp) (~650 lines). There are no header files or split modules.
 
 **Storage layers:**
 
-- **NVS (Preferences)**: UID→name registry, state flags (`esperandoTarjeta`, `modoEliminar`), RTC sync signature, last-cleanup date.
-- **LittleFS**: Append-only log file. Each line is `timestamp|uid|name`. Capped at 300 displayed entries; file is streamed to avoid loading it fully into RAM.
+- **NVS (Preferences)** namespace `"nfc"`: UID→name registry, code registry, state mailboxes, RTC sync signature, last-cleanup date.
+- **LittleFS**: Append-only log file `/logs.txt`. Each line is `timestamp|uid|nombre|codigo` (4 fields; parser accepts 3-field legacy entries). Capped at 300 displayed entries via two-pass streaming to avoid loading the file fully into RAM.
 
-**Web server flow (async polling pattern):**
+**NVS key schema:**
 
-1. User triggers an action (register / delete) via the browser.
-2. ESP32 sets a state flag and waits for a card tap.
-3. Browser polls `GET /status` every 700 ms.
-4. On card tap, result is stored in NVS; server responds to the next poll with a redirect to `/done` or `/deleted`.
+| Key           | Value                                           |
+| ------------- | ----------------------------------------------- |
+| `<uid>`       | User name string                                |
+| `"k" + <uid>` | User code (1–6 alphanumeric chars)              |
+| `buildID`     | `__DATE__ + __TIME__` — detects new firmware    |
+| `lastClean`   | `YYYY-MM-DD` — prevents double auto-cleanup     |
+| `lastReg`     | Polling mailbox: `OK\|uid\|name\|code\|ts`      |
+| `lastDel`     | Polling mailbox: `DELETED\|…` or `NOT_FOUND\|…` |
 
-**Auto-cleanup:** At midnight on the 15th and last day of each month, all log entries are deleted (user registry is preserved). An NVS key prevents the cleanup from running more than once per day.
+**Web server routes:**
 
-**RTC sync:** On first boot after a new firmware upload, the RTC is set to the compile-time `__DATE__`/`__TIME__`. Detection uses a signature stored in NVS.
+| Route           | Method | Purpose                                    |
+| --------------- | ------ | ------------------------------------------ |
+| `/`             | GET    | Home: status + live clock                  |
+| `/register`     | GET    | Registration form (name + 1–6 char code)   |
+| `/saveName`     | POST   | Sets `esperandoTarjeta = true`, waits card |
+| `/deleteUser`   | GET    | Sets `modoEliminar = true`, waits card     |
+| `/status`       | GET    | Polling endpoint (700 ms interval)         |
+| `/done`         | GET    | Registration confirmation (from poll)      |
+| `/deleted`      | GET    | Deletion confirmation (from poll)          |
+| `/cancelar`     | GET    | Clears all pending state flags             |
+| `/logs`         | GET    | Log HTML table (latest 300)                |
+| `/downloadLogs` | GET    | Log as plain-text download                 |
+| `/clearLogs`    | GET    | Deletes `/logs.txt`                        |
+| `/time`         | GET    | Current timestamp (used by live clock JS)  |
+
+**Async polling pattern:**
+
+1. User triggers register/delete → ESP32 sets a state flag and returns an HTML page.
+2. Browser polls `GET /status` every 700 ms.
+3. `loop()` detects a card tap and writes the result to the NVS mailbox (`lastReg` / `lastDel`).
+4. Next `/status` poll reads the mailbox, clears it, and responds with the result → browser redirects to `/done` or `/deleted`.
+
+**LCD non-blocking timer:** `tiempoLcdHasta` (ms) + `lcdPost` enum control display: after showing a name for 3–4 s, `loop()` reverts the screen to `"Esperando tarjeta..."` (idle) or `"Listo"` without blocking.
+
+**Auto-cleanup:** Checked every 60 s; runs at hour 00:xx on the 15th and last day of each month. Deletes `/logs.txt` only — NVS registry is preserved. `lastClean` NVS key prevents double-execution on the same day.
+
+**RTC sync:** On first boot after a new firmware upload (`buildID` mismatch), the RTC is set to compile-time `__DATE__`/`__TIME__`. On subsequent boots the time is left intact but control registers are restored. Timestamp format: `YYYY-MM-DD HH:MM:SS`.
 
 ## Key Functions
 
-| Function                      | Purpose                                                |
-| ----------------------------- | ------------------------------------------------------ |
-| `leerUidUnaVez()`             | Returns a card UID only once per placement (debounced) |
-| `uidAHex()`                   | Converts byte array UID to hex string                  |
-| `rtcLeer()` / `rtcEscribir()` | Raw I2C register access for SD3078                     |
-| `rtcAjustarHora()`            | Sets RTC time using BCD encoding                       |
-| `rtcSincronizarSiNecesario()` | Auto-syncs RTC to compile time on new firmware         |
-| `obtenerTimestamp()`          | Returns `DD/MM/YYYY HH:MM:SS` string from RTC          |
-| `logAgregar()`                | Appends a `timestamp\|uid\|name` line to LittleFS      |
-| `logParsear()`                | Parses a log line; skips malformed entries             |
-| `logHtml()` / `logTexto()`    | Renders logs as HTML table or plain text               |
+| Function                      | Purpose                                                         |
+| ----------------------------- | --------------------------------------------------------------- |
+| `leerUidUnaVez()`             | Returns a card UID only once per placement (debounced)          |
+| `uidAHex()`                   | Converts byte array UID to uppercase hex string                 |
+| `lcdMostrar()`                | Clears LCD and prints up to 4 lines (truncates at 20 chars)     |
+| `lcdMostrarNombre()`          | Word-splits a full name across lines; code right-aligned row 4  |
+| `rtcLeer()` / `rtcEscribir()` | Raw I2C register access for SD3078                              |
+| `rtcHabilitarEscritura()`     | 3-step sequence to unlock SD3078 time registers                 |
+| `rtcAjustarHora()`            | Sets RTC time using BCD encoding                                |
+| `rtcReiniciarRegistros()`     | Restores control bits (EOSC, 24H) without changing the time     |
+| `rtcSincronizarSiNecesario()` | Auto-syncs RTC to compile time on new firmware                  |
+| `parsearCompilacion()`        | Parses `__DATE__`/`__TIME__` macros into numeric fields         |
+| `obtenerTimestamp()`          | Returns `YYYY-MM-DD HH:MM:SS` string from RTC (validates range) |
+| `logAgregar()`                | Appends a `timestamp\|uid\|nombre\|codigo` line to LittleFS     |
+| `logParsear()`                | Parses a log line; handles 3- and 4-field formats               |
+| `logHtml()` / `logTexto()`    | Renders logs as HTML table or plain-text download               |
+| `autoLimpiarLogs()`           | Bi-monthly log auto-cleanup (called from `loop()`)              |
+| `pagina()`                    | Wraps HTML body with doctype, viewport meta, and shared styles  |
 
 ## Dependencies
 
 Declared in [platformio.ini](platformio.ini):
 
 - `adafruit/Adafruit PN532 @ ^1.2.4`
+- `marcoschwartz/LiquidCrystal_I2C @ ^1.1.4`
 
 All other libraries (`WiFi`, `WebServer`, `Preferences`, `Wire`, `LittleFS`) are part of the ESP32 Arduino framework and require no extra declaration.
 

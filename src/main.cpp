@@ -12,8 +12,6 @@
 #define RTC_SDA        19
 #define RTC_SCL        18
 #define RTC_DIRECCION  0x32
-#define REG_FIRMA1     0x2C
-#define REG_FIRMA2     0x2D
 #define ARCHIVO_LOG    "/logs.txt"
 
 TwoWire           busRtc = TwoWire(1);
@@ -90,11 +88,15 @@ int rtcLeer(int registro) {
   return busRtc.read();
 }
 void rtcHabilitarEscritura() {
-  // El SD3078 tiene protección de escritura por hardware de dos pasos:
-  // 1) activar WRTC1 en reg 0x10, luego 2) activar WRTC2+WRTC3 en reg 0x0F.
-  // Se escribe 0x84 fijo (no read-modify-write) para evitar corrupción post-reset.
-  rtcEscribir(0x10, 0x80); delay(5);
-  rtcEscribir(0x0F, 0x84); delay(5);
+  // El SD3078 requiere una secuencia de TRES pasos para activar EOSC (bit 4 de 0x10):
+  // El chip rechaza la escritura de EOSC si WRTC2/WRTC3 no están activos primero.
+  // Paso 1: activar WRTC1 en 0x10 → habilita escritura en CTR1 (0x0F)
+  // Paso 2: activar WRTC2+WRTC3 en 0x0F → habilita escritura en registros de hora
+  // Paso 3: reescribir 0x10 con EOSC=1 → ahora aceptado porque WRTC1+2+3 están activos
+  // EOSC (bit 4): oscilador activo en modo batería (VCC ausente). Sin él la hora congela.
+  rtcEscribir(0x10, 0x80); delay(5);  // Paso 1: WRTC1=1
+  rtcEscribir(0x0F, 0x84); delay(5);  // Paso 2: WRTC3=1, WRTC2=1, 24H, RTCF=0
+  rtcEscribir(0x10, 0x90); delay(5);  // Paso 3: WRTC1=1 + EOSC=1
 }
 void rtcAjustarHora(int anio, int mes, int dia, int hora, int minuto, int segundo) {
   rtcHabilitarEscritura();
@@ -109,6 +111,37 @@ void rtcAjustarHora(int anio, int mes, int dia, int hora, int minuto, int segund
   busRtc.write(bin2bcd(anio - 2000));
   busRtc.endTransmission();
 }
+// Reescribe la hora actual en el RTC sin modificarla, restaurando los registros de
+// control y los bits críticos que el SD3078 pierde al cortarse la alimentación:
+//   - Registros 0x0F / 0x10 (write-protection): se resetean al perder VCC.
+//   - Bit 7 del registro de segundos (0x00): en algunos ciclos queda en 1 (halt),
+//     deteniendo el oscilador aunque la batería esté presente.
+//   - Bit 7 del registro de horas (0x02): garantiza modo 24H.
+// La batería conserva los valores de hora; solo hay que leerlos y reescribirlos
+// con los bits de control correctos para que el oscilador retome el conteo.
+void rtcReiniciarRegistros() {
+  rtcHabilitarEscritura();
+  busRtc.beginTransmission(RTC_DIRECCION);
+  busRtc.write(0x00); busRtc.endTransmission(false);
+  busRtc.requestFrom(RTC_DIRECCION, 7);
+  int rSeg  = busRtc.read() & 0x7F;   // enmascarar bit 7 → oscilador activo
+  int rMin  = busRtc.read() & 0x7F;
+  int rHora = busRtc.read() & 0x3F;   // extraer horas sin bits de control
+  busRtc.read();                       // día de semana, se descarta
+  int rDia  = busRtc.read() & 0x3F;
+  int rMes  = busRtc.read() & 0x1F;
+  int rAnio = busRtc.read();
+  busRtc.beginTransmission(RTC_DIRECCION);
+  busRtc.write(0x00);
+  busRtc.write(rSeg);           // bit 7 = 0 → oscilador activo
+  busRtc.write(rMin);
+  busRtc.write(rHora | 0x80);  // bit 7 = 1 → modo 24H garantizado
+  busRtc.write(1);              // día de semana (no se usa)
+  busRtc.write(rDia);
+  busRtc.write(rMes);
+  busRtc.write(rAnio);
+  busRtc.endTransmission();
+}
 String obtenerTimestamp() {
   busRtc.beginTransmission(RTC_DIRECCION);
   busRtc.write(0x00); busRtc.endTransmission(false);
@@ -120,6 +153,13 @@ String obtenerTimestamp() {
   int dia  = bcd2bin(busRtc.read() & 0x3F);
   int mes  = bcd2bin(busRtc.read() & 0x1F);
   int anio = 2000 + bcd2bin(busRtc.read());
+  // Validar rangos: si algún valor es absurdo (ej. 2074-01-00 35:04:24) es
+  // corrupción del RTC. Se informa por Serial y se devuelve un marcador de error.
+  if (anio < 2020 || anio > 2099 || mes < 1 || mes > 12 ||
+      dia < 1 || dia > 31 || hora > 23 || minuto > 59 || seg > 59) {
+    Serial.println("RTC ERROR: valores invalidos");
+    return "RTC-ERROR";
+  }
   char buffer[20];
   snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d", anio, mes, dia, hora, minuto, seg);
   return String(buffer);
@@ -142,20 +182,20 @@ void rtcSincronizarSiNecesario() {
   int anio, mes, dia, hora, minuto, segundo;
   parsearCompilacion(anio, mes, dia, hora, minuto, segundo);
 
-  // La "firma" son 2 bytes derivados de la fecha/hora de compilación.
-  // Se guardan en la RAM interna del RTC (no se borran al apagar).
-  // Si no coinciden con los guardados → es una compilación nueva → actualizar hora.
-  int firma1 = dia ^ mes ^ (anio & 0xFF);
-  int firma2 = hora ^ minuto ^ segundo;
-
-  if (rtcLeer(REG_FIRMA1) != firma1 || rtcLeer(REG_FIRMA2) != firma2) {
+  // Comparar el buildID guardado en NVS con el de esta compilación.
+  // El NVS persiste a través de resets físicos y cortes de luz, por lo que
+  // un reinicio por botón NO actualiza el RTC; solo una nueva compilación sí.
+  String buildIdActual = String(__DATE__) + __TIME__;
+  if (almacen.getString("buildID", "") != buildIdActual) {
+    // Nueva compilación: escribir hora de compilación y guardar buildID.
     rtcAjustarHora(anio, mes, dia, hora, minuto, segundo);
-    delay(10);  // dar tiempo al RTC para estabilizarse antes de escribir la firma
-    rtcHabilitarEscritura();
-    rtcEscribir(REG_FIRMA1, firma1);
-    rtcEscribir(REG_FIRMA2, firma2);
+    almacen.putString("buildID", buildIdActual);
     Serial.println("RTC: hora actualizada.");
   } else {
+    // Mismo firmware: NO cambiar la hora, pero sí restaurar los registros de
+    // control del SD3078 que se pierden al cortar la alimentación principal.
+    // Esto evita que el oscilador quede detenido tras un corte de luz.
+    rtcReiniciarRegistros();
     Serial.println("RTC: misma compilacion, hora intacta.");
   }
   Serial.println("RTC: " + obtenerTimestamp());
@@ -475,14 +515,48 @@ void setup() {
 
   lcd.init(); lcd.backlight();
   lcdMostrar("Sistema NFC", "Iniciando...", "", "");
+  // almacen debe inicializarse antes de rtcSincronizarSiNecesario(),
+  // ya que ahora usa NVS para detectar si la compilación es nueva.
+  almacen.begin("nfc", false);
+  LittleFS.begin(true);  // montar LittleFS (true = formatear si detecta corrupción)
+
   busRtc.begin(RTC_SDA, RTC_SCL); delay(50);
   busRtc.beginTransmission(RTC_DIRECCION);
   rtcDisponible = (busRtc.endTransmission() == 0);
-  if (rtcDisponible) rtcSincronizarSiNecesario();
-  else Serial.println("AVISO: RTC no encontrado. Usando millis().");
-
-  almacen.begin("nfc", false);
-  LittleFS.begin(true);  // montar LittleFS (true = formatear si detecta corrupción)
+  if (rtcDisponible) {
+    // ① Habilitar switchover automático a batería (CTR2 = 0x0F).
+    //    Debe escribirse ANTES de cualquier otra configuración y SIN pasar por
+    //    rtcHabilitarEscritura(), porque los bits de battery-switchover del SD3078
+    //    no están bajo la misma protección que los registros de hora.
+    //    0x80 = bit 7: activa el modo de cambio automático a batería cuando VCC cae.
+    rtcEscribir(0x0F, 0x80); delay(5);
+    rtcSincronizarSiNecesario();
+    // ② Debug: leer registros clave del SD3078 para verificar estado real del chip.
+    // 0x00 bit7 = Clock Halt (0=corriendo, 1=detenido)
+    // 0x0E = CTR0 (debe ser 0x00, chip no lo usa activamente)
+    // 0x0F = CTR1: bit7=WRTC3, bit2=WRTC2, bit1=RTCF, bit0=12/24H
+    // 0x10 = CTR2: bit7=WRTC1, bit4=EOSC (1=oscilador ON en batería)
+    int dbg00 = rtcLeer(0x00);
+    Serial.printf("RTC 0x00 (seg)  = 0x%02X  bit7(CH)=%d\n",  dbg00, (dbg00>>7)&1);
+    Serial.printf("RTC 0x0E (CTR0) = 0x%02X\n",               rtcLeer(0x0E));
+    Serial.printf("RTC 0x0F (CTR1) = 0x%02X  WRTC3=%d WRTC2=%d RTCF=%d 24H=%d\n",
+      rtcLeer(0x0F),
+      (rtcLeer(0x0F)>>7)&1, (rtcLeer(0x0F)>>2)&1,
+      (rtcLeer(0x0F)>>1)&1, !((rtcLeer(0x0F))&1));
+    Serial.printf("RTC 0x10 (CTR2) = 0x%02X  WRTC1=%d EOSC=%d\n",
+      rtcLeer(0x10),
+      (rtcLeer(0x10)>>7)&1, (rtcLeer(0x10)>>4)&1);
+    // ── HIPÓTESIS 2 (si EOSC fix no resuelve el congelamiento) ──────────────
+    // Si 0x10 muestra EOSC=1 pero el reloj sigue congelando, la causa probable
+    // es que el SD3078 requiere que los bits WRTC (0x0F/0x10) estén en 0 para
+    // activar el modo batería. En ese caso habría que deshabilitar write-protect
+    // DESPUÉS de escribir la hora, dejando 0x0F=0x00 y 0x10=0x00 en reposo.
+    // Eso corresponde a la función rtcDeshabilitarEscritura() que se eliminó.
+    // Probar: restaurar rtcDeshabilitarEscritura() y verificar si 0x0F=0x00
+    // y 0x10=0x00 en reposo permiten el switchover correcto a batería.
+  } else {
+    Serial.println("AVISO: RTC no encontrado. Usando millis().");
+  }
 
   lectorNfc.begin();
   uint32_t versionFirmware = lectorNfc.getFirmwareVersion();
