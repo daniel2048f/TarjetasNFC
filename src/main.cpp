@@ -1,5 +1,4 @@
 #include <Arduino.h>
-
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -7,12 +6,21 @@
 #include <LittleFS.h>
 #include <Adafruit_PN532.h>
 #include <LiquidCrystal_I2C.h>
+#include <ESP_Mail_Client.h>
 
+// ── Hardware ──────────────────────────────────────────────────
 // I2C: busRtc(SDA=19,SCL=18)→RTC SD3078 | Wire(SDA=21,SCL=22)→PN532+LCD(0x27)
 #define RTC_SDA        19
 #define RTC_SCL        18
 #define RTC_DIRECCION  0x32
 #define ARCHIVO_LOG    "/logs.txt"
+#define ARCHIVO_ENT    "/entradas.txt"
+
+// ── Credenciales SMTP del remitente (cambiar antes de compilar) ──
+#define SMTP_HOST        "smtp.gmail.com"
+#define SMTP_PORT        465
+#define REMITENTE_EMAIL  "tu_cuenta@gmail.com"          // ← Tu cuenta Gmail
+#define REMITENTE_CLAVE  "xxxxxxxxxxxxxxxxxxxx"         // ← App Password de Gmail (sin espacios)
 
 TwoWire           busRtc = TwoWire(1);
 Adafruit_PN532    lectorNfc(21, 22);
@@ -22,6 +30,7 @@ const char* SSID_AP  = "NFC";
 const char* CLAVE_AP = "12345678";
 WebServer   servidor(80);
 Preferences almacen;
+SMTPSession smtp;
 
 String nombrePendiente      = "";
 String codigoPendiente      = "";
@@ -33,8 +42,10 @@ bool   tarjetaPresente      = false;
 
 unsigned long ultimaLecturaNfc      = 0;
 unsigned long ultimoChequeoLimpieza = 0;
+unsigned long ultimaReconexionWifi  = 0;
 const unsigned long INTERVALO_NFC      = 300;
 const unsigned long INTERVALO_LIMPIEZA = 60000;
+const unsigned long INTERVALO_WIFI     = 30000;
 bool rtcDisponible = false;
 
 // Timer no bloqueante para volver al mensaje idle tras mostrar un nombre
@@ -117,8 +128,6 @@ void rtcAjustarHora(int anio, int mes, int dia, int hora, int minuto, int segund
 //   - Bit 7 del registro de segundos (0x00): en algunos ciclos queda en 1 (halt),
 //     deteniendo el oscilador aunque la batería esté presente.
 //   - Bit 7 del registro de horas (0x02): garantiza modo 24H.
-// La batería conserva los valores de hora; solo hay que leerlos y reescribirlos
-// con los bits de control correctos para que el oscilador retome el conteo.
 void rtcReiniciarRegistros() {
   rtcHabilitarEscritura();
   busRtc.beginTransmission(RTC_DIRECCION);
@@ -153,8 +162,6 @@ String obtenerTimestamp() {
   int dia  = bcd2bin(busRtc.read() & 0x3F);
   int mes  = bcd2bin(busRtc.read() & 0x1F);
   int anio = 2000 + bcd2bin(busRtc.read());
-  // Validar rangos: si algún valor es absurdo (ej. 2074-01-00 35:04:24) es
-  // corrupción del RTC. Se informa por Serial y se devuelve un marcador de error.
   if (anio < 2020 || anio > 2099 || mes < 1 || mes > 12 ||
       dia < 1 || dia > 31 || hora > 23 || minuto > 59 || seg > 59) {
     Serial.println("RTC ERROR: valores invalidos");
@@ -168,9 +175,6 @@ void parsearCompilacion(int &anio, int &mes, int &dia, int &hora, int &minuto, i
   const char *fecha = __DATE__, *tiempo = __TIME__;
   dia  = atoi(fecha + 4);
   anio = atoi(fecha + 7);
-  // __DATE__ tiene el mes como texto ("Jan", "Feb"...). Se busca esas 3 letras
-  // dentro del string de referencia; la posición dividida por 3 da el índice
-  // base-0 del mes, y sumando 1 se obtiene el número de mes (1–12).
   char nombreMes[4] = { fecha[0], fecha[1], fecha[2], 0 };
   const char* meses = "JanFebMarAprMayJunJulAugSepOctNovDec";
   mes     = (strstr(meses, nombreMes) - meses) / 3 + 1;
@@ -181,24 +185,37 @@ void parsearCompilacion(int &anio, int &mes, int &dia, int &hora, int &minuto, i
 void rtcSincronizarSiNecesario() {
   int anio, mes, dia, hora, minuto, segundo;
   parsearCompilacion(anio, mes, dia, hora, minuto, segundo);
-
-  // Comparar el buildID guardado en NVS con el de esta compilación.
-  // El NVS persiste a través de resets físicos y cortes de luz, por lo que
-  // un reinicio por botón NO actualiza el RTC; solo una nueva compilación sí.
   String buildIdActual = String(__DATE__) + __TIME__;
   if (almacen.getString("buildID", "") != buildIdActual) {
-    // Nueva compilación: escribir hora de compilación y guardar buildID.
     rtcAjustarHora(anio, mes, dia, hora, minuto, segundo);
     almacen.putString("buildID", buildIdActual);
     Serial.println("RTC: hora actualizada.");
   } else {
-    // Mismo firmware: NO cambiar la hora, pero sí restaurar los registros de
-    // control del SD3078 que se pierden al cortar la alimentación principal.
-    // Esto evita que el oscilador quede detenido tras un corte de luz.
     rtcReiniciarRegistros();
     Serial.println("RTC: misma compilacion, hora intacta.");
   }
   Serial.println("RTC: " + obtenerTimestamp());
+}
+
+// ── Helpers RTC para leer fecha/hora sin timestamp completo ───
+struct FechaHora { int anio, mes, dia, hora, minuto, segundo; };
+FechaHora rtcLeerFechaHora() {
+  FechaHora fh = {0,0,0,0,0,0};
+  busRtc.beginTransmission(RTC_DIRECCION); busRtc.write(0x00);
+  busRtc.endTransmission(false); busRtc.requestFrom(RTC_DIRECCION, 7);
+  fh.segundo = bcd2bin(busRtc.read() & 0x7F);
+  fh.minuto  = bcd2bin(busRtc.read() & 0x7F);
+  fh.hora    = bcd2bin(busRtc.read() & 0x3F);
+  busRtc.read();
+  fh.dia  = bcd2bin(busRtc.read() & 0x3F);
+  fh.mes  = bcd2bin(busRtc.read() & 0x1F);
+  fh.anio = 2000 + bcd2bin(busRtc.read());
+  return fh;
+}
+int ultimoDiaDelMes(int mes, int anio) {
+  const int dias[] = { 0,31,28,31,30,31,30,31,31,30,31,30,31 };
+  bool bisiesto = (anio % 4 == 0 && (anio % 100 != 0 || anio % 400 == 0));
+  return dias[mes] + (mes == 2 && bisiesto ? 1 : 0);
 }
 
 // ── HTML ─────────────────────────────────────────────────────
@@ -208,7 +225,10 @@ const char ESTILOS[] =
   "input{padding:10px;width:100%;box-sizing:border-box}"
   ".card{border:1px solid #ddd;border-radius:10px;padding:16px;margin:12px 0}"
   ".muted{color:#666;font-size:14px}.ts{color:#444;font-size:13px;font-family:monospace}"
-  ".btn-danger{background:#dc3545;color:white;font-weight:bold}</style>";
+  ".btn-danger{background:#dc3545;color:white;font-weight:bold}"
+  ".btn-ok{background:#28a745;color:white;font-weight:bold}"
+  ".btn-email{background:#0066cc;color:white;font-weight:bold}"
+  ".entrada{color:#28a745;font-weight:bold}.salida{color:#dc3545;font-weight:bold}</style>";
 
 String pagina(const String& titulo, const String& cuerpo) {
   return "<!doctype html><html><head><meta charset='utf-8'>"
@@ -216,7 +236,7 @@ String pagina(const String& titulo, const String& cuerpo) {
          "<title>" + titulo + "</title>" + ESTILOS + "</head><body>" + cuerpo + "</body></html>";
 }
 
-// ── Logs (LittleFS) ──────────────────────────────────────────
+// ── Logs de acceso (LittleFS) ─────────────────────────────────
 void logAgregar(const String& ts, const String& uid, const String& nombre, const String& codigo) {
   File f = LittleFS.open(ARCHIVO_LOG, "a");
   if (f) { f.println(ts + "|" + uid + "|" + nombre + "|" + codigo); f.close(); }
@@ -245,13 +265,10 @@ String logHtml() {
   if (!f || !f.size())
     return "<div class='card'><div class='muted'>No hay eventos registrados.</div></div>";
 
-  // Primera pasada: contar líneas totales del archivo
   int total = 0;
   while (f.available()) { if (f.read() == '\n') total++; }
-  f.seek(0);  // volver al inicio del archivo para la segunda pasada
+  f.seek(0);
 
-  // Segunda pasada: cargar en memoria solo las últimas 300 entradas para no
-  // saturar la RAM del ESP32. new/delete[] reserva y libera el arreglo en heap.
   int mostrar = min(total, 300);
   int saltar  = total - mostrar;
   String* buf = new String[mostrar];
@@ -267,7 +284,7 @@ String logHtml() {
   String resultado = "<div class='card'><div class='muted'>Total: " + String(total) + " eventos";
   if (total > 300) resultado += " (mostrando los ultimos 300)";
   resultado += "</div><hr>";
-  for (int i = n - 1; i >= 0; i--) {  // recorrido inverso: más reciente primero
+  for (int i = n - 1; i >= 0; i--) {
     String ts, uid, nombre, codigo;
     if (!logParsear(buf[i], ts, uid, nombre, codigo)) continue;
     resultado += "<div><b>" + nombre + "</b>";
@@ -275,52 +292,242 @@ String logHtml() {
     resultado += " <span class='muted'>(UID: " + uid + ")</span><br>"
                  "<span class='ts'>&#128336; " + ts + "</span></div><hr>";
   }
-  delete[] buf;  // liberar el arreglo de la memoria heap
+  delete[] buf;
   return resultado + "</div>";
 }
 
-String logTexto() {
+// Genera CSV con encabezado para descarga y adjunto de email
+String logCsv() {
+  String resultado = "Timestamp,UID,Nombre,Codigo\n";
   File f = LittleFS.open(ARCHIVO_LOG, "r");
-  if (!f || !f.size()) return "Sin registros.\n";
-  String resultado = "=== REGISTRO DE ACCESOS ===\nGenerado: " +
-                     (rtcDisponible ? obtenerTimestamp() : String("sin RTC")) + "\n\n";
-  int n = 1;
+  if (!f || !f.size()) return resultado;
   while (f.available()) {
     String l = f.readStringUntil('\n'); l.trim();
     if (!l.length()) continue;
     String ts, uid, nombre, codigo;
     if (!logParsear(l, ts, uid, nombre, codigo)) continue;
-    char linea[8]; snprintf(linea, sizeof(linea), "%4d. ", n++);
-    resultado += String(linea) + ts + "   " + nombre;
-    if (codigo.length()) resultado += " [" + codigo + "]";
-    resultado += "   (UID: " + uid + ")\n";
+    resultado += ts + "," + uid + "," + nombre + "," + codigo + "\n";
   }
   f.close();
-  return resultado + "\nFin del registro.\n";
+  return resultado;
 }
 
+// ── Entradas / Salidas (LittleFS) ────────────────────────────
+void entradaAgregar(const String& ts, const String& uid, const String& nombre,
+                    const String& codigo, const String& tipo) {
+  File f = LittleFS.open(ARCHIVO_ENT, "a");
+  if (f) { f.println(ts + "|" + uid + "|" + nombre + "|" + codigo + "|" + tipo); f.close(); }
+}
+
+bool entradaParsear(const String& linea, String &ts, String &uid, String &nombre,
+                    String &codigo, String &tipo) {
+  int p1 = linea.indexOf('|');
+  int p2 = linea.indexOf('|', p1+1);
+  int p3 = linea.indexOf('|', p2+1);
+  int p4 = linea.indexOf('|', p3+1);
+  if (p1<0 || p2<0 || p3<0 || p4<0) return false;
+  ts     = linea.substring(0, p1);
+  uid    = linea.substring(p1+1, p2);
+  nombre = linea.substring(p2+1, p3);
+  codigo = linea.substring(p3+1, p4);
+  tipo   = linea.substring(p4+1);
+  tipo.trim();
+  return true;
+}
+
+// Vista HTML agrupada por UID/nombre, con entradas cronológicas dentro de cada grupo
+String entradaHtml() {
+  File f = LittleFS.open(ARCHIVO_ENT, "r");
+  if (!f || !f.size())
+    return "<div class='card'><div class='muted'>No hay registros de entradas/salidas.</div></div>";
+
+  int total = 0;
+  while (f.available()) { if (f.read() == '\n') total++; }
+  f.seek(0);
+
+  int mostrar = min(total, 300);
+  int saltar  = total - mostrar;
+  String* buf = new String[mostrar];
+  int n = 0, fila = 0;
+  while (f.available()) {
+    String l = f.readStringUntil('\n'); l.trim();
+    if (!l.length()) continue;
+    if (fila++ < saltar) continue;
+    buf[n++] = l;
+  }
+  f.close();
+
+  // Recopilar UIDs únicos en orden de primera aparición (máx 100 usuarios)
+  const int MAX_UIDS = 100;
+  String uids[MAX_UIDS]; int nu = 0;
+  for (int i = 0; i < n && nu < MAX_UIDS; i++) {
+    String ts, uid, nombre, codigo, tipo;
+    if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
+    bool existe = false;
+    for (int j = 0; j < nu; j++) { if (uids[j] == uid) { existe = true; break; } }
+    if (!existe) uids[nu++] = uid;
+  }
+
+  String resultado = "<div class='card'><div class='muted'>Total: " + String(total) + " registros";
+  if (total > 300) resultado += " (mostrando los ultimos 300)";
+  resultado += "</div><hr>";
+
+  for (int u = 0; u < nu; u++) {
+    // Obtener el nombre del primer registro de este UID
+    String nombreGrupo = uids[u];
+    for (int i = 0; i < n; i++) {
+      String ts, uid, nombre, codigo, tipo;
+      if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
+      if (uid == uids[u]) { nombreGrupo = nombre; break; }
+    }
+    resultado += "<div class='card' style='margin:6px 0'>"
+                 "<b>" + nombreGrupo + "</b> <span class='muted'>(UID: " + uids[u] + ")</span>";
+    for (int i = 0; i < n; i++) {
+      String ts, uid, nombre, codigo, tipo;
+      if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
+      if (uid != uids[u]) continue;
+      String cls = (tipo == "Entrada") ? "entrada" : "salida";
+      resultado += "<div style='padding:3px 0 3px 8px'>"
+                   "<span class='" + cls + "'>&#x25cf; " + tipo + "</span>"
+                   " <span class='ts'>&#128336; " + ts + "</span>";
+      if (codigo.length()) resultado += " <span class='muted'>[" + codigo + "]</span>";
+      resultado += "</div>";
+    }
+    resultado += "</div>";
+  }
+
+  delete[] buf;
+  return resultado + "</div>";
+}
+
+// Genera CSV con encabezado para descarga y adjunto de email
+String entradaCsv() {
+  String resultado = "Timestamp,UID,Nombre,Codigo,Tipo\n";
+  File f = LittleFS.open(ARCHIVO_ENT, "r");
+  if (!f || !f.size()) return resultado;
+  while (f.available()) {
+    String l = f.readStringUntil('\n'); l.trim();
+    if (!l.length()) continue;
+    String ts, uid, nombre, codigo, tipo;
+    if (!entradaParsear(l, ts, uid, nombre, codigo, tipo)) continue;
+    resultado += ts + "," + uid + "," + nombre + "," + codigo + "," + tipo + "\n";
+  }
+  f.close();
+  return resultado;
+}
+
+// ── Email ─────────────────────────────────────────────────────
+void smtpCallback(SMTP_Status status) {
+  Serial.print("SMTP: "); Serial.println(status.info());
+}
+
+// Envía ambos CSV como adjuntos al email guardado en NVS.
+// Devuelve true si el envío fue exitoso.
+bool enviarEmail(const String& csvLog, const String& csvEntradas) {
+  String destino = almacen.getString("emailDest", "");
+  if (!destino.length() || WiFi.status() != WL_CONNECTED) return false;
+
+  String fechaHoy = rtcDisponible ? obtenerTimestamp().substring(0, 10) : "sin-fecha";
+  String asunto   = "Registros NFC - " + fechaHoy;
+  String cuerpo   = "Reporte automatico del sistema NFC.\n"
+                    "Fecha: " + fechaHoy + "\n\n"
+                    "Adjuntos:\n"
+                    "  - accesos.csv  : log de accesos por tarjeta\n"
+                    "  - entradas.csv : registro de entradas y salidas\n";
+
+  Session_Config config;
+  config.server.host_name = SMTP_HOST;
+  config.server.port      = SMTP_PORT;
+  config.login.email      = REMITENTE_EMAIL;
+  config.login.password   = REMITENTE_CLAVE;
+  config.login.user_domain = "";
+  // NTP para que TLS pueda validar certificados; se usa si el reloj del sistema no está sincronizado
+  config.time.ntp_server    = F("pool.ntp.org,time.nist.gov");
+  config.time.gmt_offset    = 0;
+  config.time.day_light_offset = 0;
+
+  SMTP_Message message;
+  message.sender.name  = F("ESP32 NFC");
+  message.sender.email = REMITENTE_EMAIL;
+  message.subject      = asunto.c_str();
+  message.addRecipient(F("Destino"), destino.c_str());
+  message.text.content  = cuerpo.c_str();
+  message.text.charSet  = F("utf-8");
+
+  SMTP_Attachment attLog;
+  attLog.descr.name              = F("accesos.csv");
+  attLog.descr.mime              = F("text/csv");
+  attLog.descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
+  attLog.blob.data               = (uint8_t*)csvLog.c_str();
+  attLog.blob.size               = csvLog.length();
+  attLog.file.storage_type       = esp_mail_file_storage_type_none;
+  message.addAttachment(attLog);
+
+  SMTP_Attachment attEnt;
+  attEnt.descr.name              = F("entradas.csv");
+  attEnt.descr.mime              = F("text/csv");
+  attEnt.descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
+  attEnt.blob.data               = (uint8_t*)csvEntradas.c_str();
+  attEnt.blob.size               = csvEntradas.length();
+  attEnt.file.storage_type       = esp_mail_file_storage_type_none;
+  message.addAttachment(attEnt);
+
+  smtp.debug(0);
+  smtp.callback(smtpCallback);
+
+  if (!smtp.connect(&config)) {
+    Serial.printf("SMTP conexion error: %s\n", smtp.errorReason().c_str());
+    return false;
+  }
+  bool ok = MailClient.sendMail(&smtp, &message, true);
+  if (!ok) Serial.printf("SMTP envio error: %s\n", smtp.errorReason().c_str());
+  smtp.closeSession();
+  return ok;
+}
+
+// ── Auto-envío de email en días fijos del mes ─────────────────
+// Días: 10, 20 y último del mes, a medianoche (hora 00:xx).
+// Usa lastEmail en NVS (mismo patrón que lastClean) para evitar doble envío.
+void autoEnviarEmail() {
+  if (!rtcDisponible || WiFi.status() != WL_CONNECTED) return;
+  if (!almacen.getString("emailDest", "").length()) return;
+
+  FechaHora fh = rtcLeerFechaHora();
+  if (fh.hora != 0) return;
+
+  int ud = ultimoDiaDelMes(fh.mes, fh.anio);
+  if (fh.dia != 10 && fh.dia != 20 && fh.dia != ud) return;
+
+  char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
+  if (almacen.getString("lastEmail", "") == String(hoy)) return;
+
+  Serial.println("AUTO-EMAIL: generando CSV...");
+  String csvLog = logCsv();
+  String csvEnt = entradaCsv();
+
+  if (enviarEmail(csvLog, csvEnt)) {
+    LittleFS.remove(ARCHIVO_LOG);
+    LittleFS.remove(ARCHIVO_ENT);
+    almacen.putString("lastEmail", String(hoy));
+    Serial.println("AUTO-EMAIL enviado: " + String(hoy));
+  } else {
+    Serial.println("AUTO-EMAIL error: no se pudo enviar.");
+  }
+}
+
+// ── Auto-limpieza de logs ─────────────────────────────────────
+// Días: 15 y último del mes, a medianoche. El email (días 10/20/último) corre
+// primero en loop(), así que si el email del último día falla, la limpieza
+// elimina los archivos de todas formas para liberar LittleFS.
 void autoLimpiarLogs() {
   if (!rtcDisponible) return;
-  // Leer solo la fecha del RTC; los primeros 2 bytes (seg, min) se descartan
-  busRtc.beginTransmission(RTC_DIRECCION); busRtc.write(0x00);
-  busRtc.endTransmission(false); busRtc.requestFrom(RTC_DIRECCION, 7);
-  busRtc.read(); busRtc.read();              // seg, min (no se necesitan)
-  int hora = bcd2bin(busRtc.read() & 0x3F);
-  busRtc.read();                             // día de semana, se descarta
-  int dia  = bcd2bin(busRtc.read() & 0x3F);
-  int mes  = bcd2bin(busRtc.read() & 0x1F);
-  int anio = 2000 + bcd2bin(busRtc.read());
+  FechaHora fh = rtcLeerFechaHora();
+  if (fh.hora != 0) return;
 
-  if (hora != 0) return;  // solo ejecutar durante la hora 00:xx (medianoche)
+  int ud = ultimoDiaDelMes(fh.mes, fh.anio);
+  if (fh.dia != 15 && fh.dia != ud) return;
 
-  // Calcular último día del mes con corrección para año bisiesto en febrero
-  const int diasPorMes[] = { 0,31,28,31,30,31,30,31,31,30,31,30,31 };
-  bool esBisiesto = (anio % 4 == 0 && (anio % 100 != 0 || anio % 400 == 0));
-  int ultimoDia   = diasPorMes[mes] + (mes == 2 && esBisiesto ? 1 : 0);
-  if (dia != 15 && dia != ultimoDia) return;
-
-  // Guardar fecha de última limpieza en NVS para no borrar dos veces el mismo día
-  char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", anio, mes, dia);
+  char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
   if (almacen.getString("lastClean", "") == String(hoy)) return;
 
   LittleFS.remove(ARCHIVO_LOG);
@@ -332,22 +539,29 @@ void autoLimpiarLogs() {
 void handleTime() {
   servidor.send(200, "text/plain", rtcDisponible ? obtenerTimestamp() : "ms:" + String(millis()));
 }
+
 void handleHome() {
   String ts     = rtcDisponible ? obtenerTimestamp() : "RTC no disponible";
   String estado = esperandoTarjeta ? "Esperando tarjeta para registrar"
                 : modoEliminar     ? "Esperando tarjeta para borrar"
                 :                    "Lectura normal";
+  String staInfo = (WiFi.status() == WL_CONNECTED)
+    ? "WiFi: " + WiFi.SSID() + " &nbsp;(" + WiFi.localIP().toString() + ")"
+    : "WiFi internet: desconectado";
+
   servidor.send(200, "text/html", pagina("ESP32 NFC",
     "<h2>ESP32 NFC</h2><div class='card'>"
     "<p>Estado: <b>" + estado + "</b></p>"
     "<p class='ts' id='clk'>&#128336; " + ts + "</p>"
-    // Script que actualiza el reloj en pantalla cada segundo consultando /time
     "<script>setInterval(async()=>{document.getElementById('clk').innerHTML="
     "'&#128336; '+await(await fetch('/time')).text();},1000);</script>"
-    "<p class='muted'>IP: 192.168.4.1</p><br>"
+    "<p class='muted'>AP: 192.168.4.1 &nbsp;|&nbsp; " + staInfo + "</p><br>"
     "<a href='/register'><button>Registrar usuario</button></a> "
-    "<a href='/logs'><button>Ver logs</button></a></div>"));
+    "<a href='/logs'><button>Ver logs</button></a> "
+    "<a href='/entradas'><button>Entradas/Salidas</button></a> "
+    "<a href='/config'><button>&#9881; Configuracion</button></a></div>"));
 }
+
 void handleRegisterForm() {
   servidor.send(200, "text/html", pagina("Registrar",
     "<h2>Registrar usuario</h2><div class='card'>"
@@ -362,6 +576,7 @@ void handleRegisterForm() {
     "<a href='/deleteUser'><button class='btn-danger'>&#128465; Borrar usuario con tarjeta</button></a></div>"
     "<a href='/'><button>Volver</button></a>"));
 }
+
 void handleSaveName() {
   if (!servidor.hasArg("name") || !servidor.hasArg("code")) {
     servidor.send(400, "text/plain", "Faltan campos"); return;
@@ -379,12 +594,12 @@ void handleSaveName() {
     "<p>Nombre: <b>" + nombrePendiente + "</b></p>"
     "<p>Codigo: <b>" + codigoPendiente + "</b></p>"
     "<p id='st'>Esperando...</p>"
-    // Polling cada 700ms a /status; cuando recibe "OK|..." redirige a /done
     "<script>setInterval(async()=>{let t=await(await fetch('/status')).text();"
     "if(t.startsWith('OK|'))location.href='/done?d='+encodeURIComponent(t);"
     "else document.getElementById('st').innerText=t;},700);</script>"
     "<a href='/cancelar'><button>Cancelar</button></a></div>"));
 }
+
 void handleDeleteUser() {
   esperandoTarjeta = false; modoEliminar = true; nombrePendiente = ""; codigoPendiente = "";
   lcdMostrar("Modo eliminar", "Acerca tarjeta", "", "");
@@ -392,15 +607,13 @@ void handleDeleteUser() {
     "<h2>Borrar usuario</h2><div class='card' style='border-color:#dc3545'>"
     "<p style='color:#dc3545;font-weight:bold'>&#9888; Acerca la tarjeta para BORRAR</p>"
     "<p id='st'>Esperando tarjeta...</p>"
-    // Mismo patrón de polling; redirige al recibir DELETED| o NOT_FOUND|
     "<script>setInterval(async()=>{let t=await(await fetch('/status')).text();"
     "if(t.startsWith('DELETED|')||t.startsWith('NOT_FOUND|'))location.href='/deleted?d='+encodeURIComponent(t);"
     "else document.getElementById('st').innerText=t;},700);</script>"
     "<a href='/cancelar'><button>Cancelar</button></a></div>"));
 }
+
 void handleStatus() {
-  // Buzón entre loop() y el navegador: loop deposita resultado, browser lo lee una sola vez
-  // y luego se limpia de NVS para no devolverlo dos veces
   if (modoEliminar || resultadoEliminacion) {
     String ultimo = almacen.getString("lastDel", "");
     if (ultimo.startsWith("DELETED|") || ultimo.startsWith("NOT_FOUND|")) {
@@ -414,11 +627,11 @@ void handleStatus() {
   if (ultimo.startsWith("OK|")) { almacen.putString("lastReg", ""); servidor.send(200, "text/plain", ultimo); return; }
   servidor.send(200, "text/plain", "Listo.");
 }
+
 void handleDone() {
   String datos  = servidor.hasArg("d") ? servidor.arg("d") : "";
   String cuerpo = "<h2>&#10003; Registrado</h2><div class='card'>";
   if (datos.startsWith("OK|")) {
-    // Formato: OK|uid|nombre|codigo|timestamp
     int pos1 = datos.indexOf('|'),
         pos2 = datos.indexOf('|', pos1+1),
         pos3 = datos.indexOf('|', pos2+1),
@@ -431,11 +644,11 @@ void handleDone() {
   cuerpo += "<a href='/'><button>Inicio</button></a> <a href='/logs'><button>Ver logs</button></a></div>";
   servidor.send(200, "text/html", pagina("Registrado", cuerpo));
 }
+
 void handleDeleted() {
   String datos  = servidor.hasArg("d") ? servidor.arg("d") : "";
   String cuerpo = "<h2>Usuario borrado</h2><div class='card'>";
   if (datos.startsWith("DELETED|")) {
-    // Formato: DELETED|uid|nombre|codigo
     int pos1 = datos.indexOf('|'),
         pos2 = datos.indexOf('|', pos1+1),
         pos3 = datos.indexOf('|', pos2+1);
@@ -450,16 +663,20 @@ void handleDeleted() {
   cuerpo += "<a href='/'><button>Inicio</button></a> <a href='/register'><button>Registrar</button></a></div>";
   servidor.send(200, "text/html", pagina("Usuario borrado", cuerpo));
 }
+
 void handleLogs() {
   servidor.send(200, "text/html", pagina("Logs",
     "<h2>Logs de acceso</h2>" + logHtml() +
-    "<div style='margin:20px 0'><a href='/'><button>Volver</button></a> "
-    "<a href='/downloadLogs'><button style='background:#28a745;color:white;font-weight:bold'>&#128229; Descargar TXT</button></a> "
-    "<a href='/clearLogs' onclick='return confirm(\"Seguro?\");'>"
-    "<button class='btn-danger'>&#128465; BORRAR TODOS LOS LOGS</button></a></div>"));
+    "<div style='margin:20px 0;display:flex;flex-wrap:wrap;gap:8px'>"
+    "<a href='/'><button>Volver</button></a> "
+    "<a href='/downloadLogs'><button class='btn-ok'>&#128229; Descargar CSV</button></a> "
+    "<a href='/sendEmail' onclick='return confirm(\"Enviar email con todos los registros ahora?\");'>"
+    "<button class='btn-email'>&#128231; Enviar por email</button></a> "
+    "<a href='/clearLogs' onclick='return confirm(\"Borrar todos los logs?\");'>"
+    "<button class='btn-danger'>&#128465; Borrar logs</button></a></div>"));
 }
+
 void handleClearLogs() {
-  // Contar entradas antes de borrar para mostrarlo en la confirmación
   int total = 0;
   File f = LittleFS.open(ARCHIVO_LOG, "r");
   if (f) { while (f.available()) { if (f.read() == '\n') total++; } f.close(); }
@@ -468,13 +685,16 @@ void handleClearLogs() {
     "<h2>Logs borrados</h2><div class='card'>"
     "<p>&#10003; Eliminados <b>" + String(total) + "</b> eventos.</p>"
     "<p class='muted'>Las asociaciones UID&rarr;Nombre NO fueron eliminadas.</p>"
-    "<a href='/logs'><button>Ver logs</button></a> <a href='/'><button>Inicio</button></a></div>"));
+    "<a href='/logs'><button>Ver logs</button></a> "
+    "<a href='/'><button>Inicio</button></a></div>"));
 }
+
 void handleDownloadLogs() {
   String ts = rtcDisponible ? obtenerTimestamp().substring(0, 10) : "logs";
-  servidor.sendHeader("Content-Disposition", "attachment; filename=\"logs_" + ts + ".txt\"");
-  servidor.send(200, "text/plain; charset=utf-8", logTexto());
+  servidor.sendHeader("Content-Disposition", "attachment; filename=\"accesos_" + ts + ".csv\"");
+  servidor.send(200, "text/csv; charset=utf-8", logCsv());
 }
+
 void handleCancelar() {
   esperandoTarjeta = false;
   modoEliminar     = false;
@@ -489,6 +709,137 @@ void handleCancelar() {
     "</div>"));
 }
 
+// ── Handlers: Entradas/Salidas ────────────────────────────────
+void handleEntradas() {
+  servidor.send(200, "text/html", pagina("Entradas/Salidas",
+    "<h2>Registros de Entradas/Salidas</h2>" + entradaHtml() +
+    "<div style='margin:20px 0;display:flex;flex-wrap:wrap;gap:8px'>"
+    "<a href='/'><button>Volver</button></a> "
+    "<a href='/downloadEntradas'><button class='btn-ok'>&#128229; Descargar CSV</button></a> "
+    "<a href='/clearEntradas' onclick='return confirm(\"Borrar todos los registros de entradas?\");'>"
+    "<button class='btn-danger'>&#128465; Borrar registros</button></a></div>"));
+}
+
+void handleDownloadEntradas() {
+  String ts = rtcDisponible ? obtenerTimestamp().substring(0, 10) : "entradas";
+  servidor.sendHeader("Content-Disposition", "attachment; filename=\"entradas_" + ts + ".csv\"");
+  servidor.send(200, "text/csv; charset=utf-8", entradaCsv());
+}
+
+void handleClearEntradas() {
+  int total = 0;
+  File f = LittleFS.open(ARCHIVO_ENT, "r");
+  if (f) { while (f.available()) { if (f.read() == '\n') total++; } f.close(); }
+  LittleFS.remove(ARCHIVO_ENT);
+  servidor.send(200, "text/html", pagina("Registros borrados",
+    "<h2>Registros borrados</h2><div class='card'>"
+    "<p>&#10003; Eliminados <b>" + String(total) + "</b> registros.</p>"
+    "<a href='/entradas'><button>Ver entradas</button></a> "
+    "<a href='/'><button>Inicio</button></a></div>"));
+}
+
+// ── Handler: Configuracion WiFi + email ──────────────────────
+void handleConfig() {
+  String ssidGuardado  = almacen.getString("ssidWifi",  "");
+  String emailGuardado = almacen.getString("emailDest", "");
+  String ultimoEmail   = almacen.getString("lastEmail", "(nunca)");
+  String estadoWifi    = (WiFi.status() == WL_CONNECTED)
+    ? "<span style='color:#28a745'>Conectado &mdash; " + WiFi.localIP().toString() + "</span>"
+    : "<span style='color:#dc3545'>Desconectado</span>";
+
+  servidor.send(200, "text/html", pagina("Configuracion",
+    "<h2>&#9881; Configuracion</h2>"
+    "<div class='card'><h3>Red WiFi con internet</h3>"
+    "<p>Estado: " + estadoWifi + "</p>"
+    "<form method='POST' action='/saveConfig'>"
+    "<label>SSID (nombre de red):</label><br>"
+    "<input name='ssid' value='" + ssidGuardado + "' placeholder='Nombre de tu WiFi'><br><br>"
+    "<label>Contrasena WiFi:</label><br>"
+    "<input type='password' name='clave' placeholder='(en blanco = no cambiar)'><br><br>"
+    "<label>Email destino para reportes:</label><br>"
+    "<input type='email' name='email' value='" + emailGuardado + "' placeholder='destino@ejemplo.com'><br><br>"
+    "<button type='submit'>&#10003; Guardar y reconectar</button></form>"
+    "<p class='muted'>Ultimo envio automatico: " + ultimoEmail + "</p>"
+    "<p class='muted'>Los reportes se envian automaticamente los dias 10, 20 y ultimo del mes a medianoche.</p>"
+    "</div>"
+    "<a href='/'><button>Volver</button></a>"));
+}
+
+void handleSaveConfig() {
+  String ssid  = servidor.hasArg("ssid")  ? servidor.arg("ssid")  : "";
+  String clave = servidor.hasArg("clave") ? servidor.arg("clave") : "";
+  String email = servidor.hasArg("email") ? servidor.arg("email") : "";
+  ssid.trim(); clave.trim(); email.trim();
+
+  if (ssid.length())  almacen.putString("ssidWifi",  ssid.c_str());
+  if (clave.length()) almacen.putString("claveWifi", clave.c_str());
+  if (email.length()) almacen.putString("emailDest", email.c_str());
+
+  // Reconectar STA con las nuevas credenciales
+  if (ssid.length()) {
+    String claveUsar = clave.length() ? clave : almacen.getString("claveWifi", "");
+    WiFi.disconnect(false);
+    delay(200);
+    WiFi.begin(ssid.c_str(), claveUsar.c_str());
+    Serial.println("WiFi: reconectando a " + ssid);
+  }
+
+  servidor.send(200, "text/html", pagina("Configuracion guardada",
+    "<h2>&#10003; Configuracion guardada</h2><div class='card'>"
+    "<p>Configuracion actualizada correctamente.</p>"
+    "<p class='muted'>Si se cambio el WiFi, la conexion puede tardar unos segundos.</p>"
+    "<a href='/config'><button>Ver estado WiFi</button></a> "
+    "<a href='/'><button>Inicio</button></a></div>"));
+}
+
+// ── Handler: Envío manual de email ───────────────────────────
+void handleSendEmail() {
+  String destino = almacen.getString("emailDest", "");
+  if (!destino.length()) {
+    servidor.send(200, "text/html", pagina("Sin destinatario",
+      "<h2>Email no configurado</h2><div class='card'>"
+      "<p>Configure el email destino en "
+      "<a href='/config'>Configuracion</a>.</p>"
+      "<a href='/logs'><button>Volver</button></a></div>"));
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    servidor.send(200, "text/html", pagina("Sin conexion",
+      "<h2>Sin conexion a internet</h2><div class='card'>"
+      "<p>Configure la red WiFi en "
+      "<a href='/config'>Configuracion</a>.</p>"
+      "<a href='/logs'><button>Volver</button></a></div>"));
+    return;
+  }
+
+  // Responder inmediatamente y enviar en background sería lo ideal, pero el WebServer
+  // de Arduino no lo soporta bien. Se envía sincrónicamente y el navegador espera.
+  servidor.sendHeader("Content-Type", "text/html; charset=utf-8");
+
+  String csvLog = logCsv();
+  String csvEnt = entradaCsv();
+  bool ok = enviarEmail(csvLog, csvEnt);
+
+  if (ok) {
+    String hoy = rtcDisponible ? obtenerTimestamp().substring(0, 10) : "";
+    if (hoy.length()) almacen.putString("lastEmail", hoy);
+    LittleFS.remove(ARCHIVO_LOG);
+    LittleFS.remove(ARCHIVO_ENT);
+    servidor.send(200, "text/html", pagina("Email enviado",
+      "<h2>&#10003; Email enviado</h2><div class='card'>"
+      "<p>Archivos enviados a <b>" + destino + "</b>.</p>"
+      "<p class='muted'>Los archivos de log y entradas han sido borrados.</p>"
+      "<a href='/'><button>Inicio</button></a></div>"));
+  } else {
+    servidor.send(200, "text/html", pagina("Error al enviar",
+      "<h2>&#10060; Error al enviar</h2><div class='card'>"
+      "<p>No se pudo enviar el correo.</p>"
+      "<p class='muted'>Verifique las credenciales SMTP en el firmware y que el WiFi tenga internet.</p>"
+      "<p class='muted'>Los archivos NO fueron borrados.</p>"
+      "<a href='/logs'><button>Volver a logs</button></a></div>"));
+  }
+}
+
 // ── NFC ──────────────────────────────────────────────────────
 String uidAHex(byte* uid, byte longitud) {
   String hex = "";
@@ -498,12 +849,11 @@ String uidAHex(byte* uid, byte longitud) {
 bool leerUidUnaVez(String &uidSalida) {
   byte uid[7]; byte longitud = 0;
   if (!lectorNfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &longitud, 50)) {
-    // Sin tarjeta: si antes había una, registrar que fue retirada y resetear el anti-repetición
     if (tarjetaPresente) { tarjetaPresente = false; ultimoUid = ""; Serial.println("Tarjeta retirada"); }
     return false;
   }
   String hex = uidAHex(uid, longitud);
-  if (tarjetaPresente && hex == ultimoUid) return false;  // anti-lectura repetida
+  if (tarjetaPresente && hex == ultimoUid) return false;
   tarjetaPresente = true; ultimoUid = uidSalida = hex; return true;
 }
 
@@ -511,31 +861,20 @@ bool leerUidUnaVez(String &uidSalida) {
 void setup() {
   Serial.begin(115200); delay(500);
 
-  Wire.begin(21, 22);  // debe inicializarse antes del LCD y el PN532
-
+  Wire.begin(21, 22);
   lcd.init(); lcd.backlight();
   lcdMostrar("Sistema NFC", "Iniciando...", "", "");
-  // almacen debe inicializarse antes de rtcSincronizarSiNecesario(),
-  // ya que ahora usa NVS para detectar si la compilación es nueva.
+
+  // NVS y LittleFS deben inicializarse antes que el RTC (buildID usa NVS)
   almacen.begin("nfc", false);
-  LittleFS.begin(true);  // montar LittleFS (true = formatear si detecta corrupción)
+  LittleFS.begin(true);
 
   busRtc.begin(RTC_SDA, RTC_SCL); delay(50);
   busRtc.beginTransmission(RTC_DIRECCION);
   rtcDisponible = (busRtc.endTransmission() == 0);
   if (rtcDisponible) {
-    // ① Habilitar switchover automático a batería (CTR2 = 0x0F).
-    //    Debe escribirse ANTES de cualquier otra configuración y SIN pasar por
-    //    rtcHabilitarEscritura(), porque los bits de battery-switchover del SD3078
-    //    no están bajo la misma protección que los registros de hora.
-    //    0x80 = bit 7: activa el modo de cambio automático a batería cuando VCC cae.
-    rtcEscribir(0x0F, 0x80); delay(5);
+    rtcEscribir(0x0F, 0x80); delay(5);  // battery switchover antes de cualquier otra config
     rtcSincronizarSiNecesario();
-    // ② Debug: leer registros clave del SD3078 para verificar estado real del chip.
-    // 0x00 bit7 = Clock Halt (0=corriendo, 1=detenido)
-    // 0x0E = CTR0 (debe ser 0x00, chip no lo usa activamente)
-    // 0x0F = CTR1: bit7=WRTC3, bit2=WRTC2, bit1=RTCF, bit0=12/24H
-    // 0x10 = CTR2: bit7=WRTC1, bit4=EOSC (1=oscilador ON en batería)
     int dbg00 = rtcLeer(0x00);
     Serial.printf("RTC 0x00 (seg)  = 0x%02X  bit7(CH)=%d\n",  dbg00, (dbg00>>7)&1);
     Serial.printf("RTC 0x0E (CTR0) = 0x%02X\n",               rtcLeer(0x0E));
@@ -546,14 +885,6 @@ void setup() {
     Serial.printf("RTC 0x10 (CTR2) = 0x%02X  WRTC1=%d EOSC=%d\n",
       rtcLeer(0x10),
       (rtcLeer(0x10)>>7)&1, (rtcLeer(0x10)>>4)&1);
-    // ── HIPÓTESIS 2 (si EOSC fix no resuelve el congelamiento) ──────────────
-    // Si 0x10 muestra EOSC=1 pero el reloj sigue congelando, la causa probable
-    // es que el SD3078 requiere que los bits WRTC (0x0F/0x10) estén en 0 para
-    // activar el modo batería. En ese caso habría que deshabilitar write-protect
-    // DESPUÉS de escribir la hora, dejando 0x0F=0x00 y 0x10=0x00 en reposo.
-    // Eso corresponde a la función rtcDeshabilitarEscritura() que se eliminó.
-    // Probar: restaurar rtcDeshabilitarEscritura() y verificar si 0x0F=0x00
-    // y 0x10=0x00 en reposo permiten el switchover correcto a batería.
   } else {
     Serial.println("AVISO: RTC no encontrado. Usando millis().");
   }
@@ -565,23 +896,38 @@ void setup() {
     : "ERROR: PN532 no detectado!");
   lectorNfc.SAMConfig();
 
-  WiFi.mode(WIFI_AP);
+  // Modo AP+STA: el ESP32 es Access Point para clientes locales Y cliente WiFi para internet
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
-  WiFi.softAP(SSID_AP, CLAVE_AP, 6);  // canal 6
+  WiFi.softAP(SSID_AP, CLAVE_AP, 6);
   Serial.println("AP: " + String(SSID_AP) + " | IP: " + WiFi.softAPIP().toString());
 
-  servidor.on("/time",         handleTime);
-  servidor.on("/",             handleHome);
-  servidor.on("/register",     handleRegisterForm);
-  servidor.on("/saveName",     HTTP_POST, handleSaveName);
-  servidor.on("/deleteUser",   handleDeleteUser);
-  servidor.on("/deleted",      handleDeleted);
-  servidor.on("/status",       handleStatus);
-  servidor.on("/done",         handleDone);
-  servidor.on("/logs",         handleLogs);
-  servidor.on("/downloadLogs", handleDownloadLogs);
-  servidor.on("/clearLogs",    handleClearLogs);
-  servidor.on("/cancelar",     handleCancelar);
+  // Si hay credenciales WiFi guardadas, intentar conectarse automáticamente
+  String ssidGuardado = almacen.getString("ssidWifi", "");
+  if (ssidGuardado.length()) {
+    String claveGuardada = almacen.getString("claveWifi", "");
+    WiFi.begin(ssidGuardado.c_str(), claveGuardada.c_str());
+    Serial.println("WiFi STA: conectando a " + ssidGuardado + "...");
+  }
+
+  servidor.on("/time",             handleTime);
+  servidor.on("/",                 handleHome);
+  servidor.on("/register",         handleRegisterForm);
+  servidor.on("/saveName",         HTTP_POST, handleSaveName);
+  servidor.on("/deleteUser",       handleDeleteUser);
+  servidor.on("/deleted",          handleDeleted);
+  servidor.on("/status",           handleStatus);
+  servidor.on("/done",             handleDone);
+  servidor.on("/logs",             handleLogs);
+  servidor.on("/downloadLogs",     handleDownloadLogs);
+  servidor.on("/clearLogs",        handleClearLogs);
+  servidor.on("/cancelar",         handleCancelar);
+  servidor.on("/entradas",         handleEntradas);
+  servidor.on("/downloadEntradas", handleDownloadEntradas);
+  servidor.on("/clearEntradas",    handleClearEntradas);
+  servidor.on("/config",           handleConfig);
+  servidor.on("/saveConfig",       HTTP_POST, handleSaveConfig);
+  servidor.on("/sendEmail",        handleSendEmail);
   servidor.begin();
   Serial.println("Servidor web iniciado!");
 
@@ -592,14 +938,32 @@ void loop() {
   servidor.handleClient();
   unsigned long ahora = millis();
 
-  // Cuando expira el timer del LCD, volver al mensaje correspondiente
+  // Volver al mensaje idle cuando expira el timer del LCD
   if (tiempoLcdHasta && ahora >= tiempoLcdHasta) {
     tiempoLcdHasta = 0;
     if (lcdPost == LCD_IDLE) lcdMostrar("Esperando", "tarjeta...", "", "");
     else                     lcdMostrar("Listo", "", "", "");
   }
 
-  if (ahora - ultimoChequeoLimpieza >= INTERVALO_LIMPIEZA) { ultimoChequeoLimpieza = ahora; autoLimpiarLogs(); }
+  // Monitorear WiFi STA: reintentar conexión si se pierde
+  if (ahora - ultimaReconexionWifi >= INTERVALO_WIFI) {
+    ultimaReconexionWifi = ahora;
+    if (WiFi.status() != WL_CONNECTED) {
+      String ssid = almacen.getString("ssidWifi", "");
+      if (ssid.length()) {
+        String clave = almacen.getString("claveWifi", "");
+        WiFi.begin(ssid.c_str(), clave.c_str());
+      }
+    }
+  }
+
+  // Auto-email primero, luego auto-limpieza (email debe correr antes para no perder datos)
+  if (ahora - ultimoChequeoLimpieza >= INTERVALO_LIMPIEZA) {
+    ultimoChequeoLimpieza = ahora;
+    autoEnviarEmail();
+    autoLimpiarLogs();
+  }
+
   if (ahora - ultimaLecturaNfc < INTERVALO_NFC) return;
   ultimaLecturaNfc = ahora;
 
@@ -620,6 +984,9 @@ void loop() {
       String codigo = almacen.getString(claveCode.c_str(), "");
       almacen.remove(uid.c_str());
       almacen.remove(claveCode.c_str());
+      // Resetear el conteo de entradas/salidas al borrar el usuario
+      String claveCont = "c" + uid;  // "c" + max 14 hex chars = 15 chars (límite NVS OK)
+      almacen.remove(claveCont.c_str());
       almacen.putString("lastDel", "DELETED|" + uid + "|" + nombre + "|" + codigo);
       Serial.println("[" + ts + "] BORRADO: " + uid + " -> " + nombre);
       lcdMostrarNombre(nombre, codigo);
@@ -641,11 +1008,21 @@ void loop() {
     esperandoTarjeta = false; codigoPendiente = ""; nombrePendiente = ""; return;
   }
 
+  // Lectura normal: registrar acceso y determinar entrada/salida
   String nombre = almacen.getString(uid.c_str(), "NO_REGISTRADO");
   String claveCode = "k" + uid;
   String codigo = almacen.getString(claveCode.c_str(), "");
   logAgregar(ts, uid, nombre, codigo);
-  Serial.println("[" + ts + "] LECTURA: " + uid + " -> " + nombre);
+
+  // Conteo persistente en NVS: impar = Entrada, par = Salida
+  // Clave "c" + uid (máx 1+14 = 15 chars, dentro del límite de NVS)
+  String claveCont = "c" + uid;
+  int conteo = almacen.getInt(claveCont.c_str(), 0) + 1;
+  almacen.putInt(claveCont.c_str(), conteo);
+  String tipo = (conteo % 2 == 1) ? "Entrada" : "Salida";
+  entradaAgregar(ts, uid, nombre, codigo, tipo);
+
+  Serial.println("[" + ts + "] " + tipo + ": " + uid + " -> " + nombre);
   lcdMostrarNombre(nombre, codigo);
   tiempoLcdHasta = millis() + 4000;
   lcdPost = LCD_IDLE;
