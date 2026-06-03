@@ -8,6 +8,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <ESP_Mail_Client.h>
 #include <RTClib.h>
+#include "nvs.h"     // iterador NVS para reconstruir ARCHIVO_UIDS al arrancar
 
 // ── Hardware ──────────────────────────────────────────────────
 // I2C: busRtc(SDA=19,SCL=18)→RTC DS3231 | Wire(SDA=21,SCL=22)→PN532+LCD(0x27)
@@ -76,8 +77,8 @@ bool          lcdBacklightOn  = true;
 unsigned long lcdIdleDesde    = 0;     // millis() al entrar en idle; 0 = no idle
 unsigned long lcdParpadeoNext = 0;     // proxima inversion del backlight
 const unsigned long LCD_IDLE_BLINK_INICIO = 120000UL; // 2 min idle antes de titular
-const unsigned long LCD_BLINK_ON_MS       = 27000UL;  // 27 s con luz encendida
-const unsigned long LCD_BLINK_OFF_MS      = 3000UL;   // 3 s con luz apagada
+const unsigned long LCD_BLINK_ON_MS       = 3000UL;  // 27 s con luz encendida
+const unsigned long LCD_BLINK_OFF_MS      = 1000UL;   // 3 s con luz apagada
 
 // Cancela el modo idle y garantiza backlight encendido.
 // Llamar antes de mostrar cualquier informacion activa en la LCD.
@@ -415,6 +416,39 @@ void uidEliminar(const String& uid) {
   if (fout) { fout.print(contenido); fout.close(); }
 }
 
+// Reconstruye ARCHIVO_UIDS leyendo el namespace "nfc" de NVS con el iterador de
+// ESP-IDF. Se llama en setup() para que los usuarios registrados antes de este
+// firmware (que solo existen en NVS) aparezcan en /usuarios desde el primer arranque.
+// Las claves UID son cadenas hex en MAYUSCULAS (0-9, A-F), 6-14 chars, sin prefijos.
+// Las demas claves del namespace ("buildID", "lastClean", "k"+uid, etc.) tienen al
+// menos un caracter minusculo o especial, por lo que no se confunden con UIDs.
+void reconstruirArchivoUids() {
+  // API de ESP-IDF 4.x: nvs_entry_find retorna el iterador directamente (no esp_err_t).
+  // nvs_entry_next avanza y retorna el siguiente; cuando agota, libera y retorna NULL.
+  nvs_iterator_t it = nvs_entry_find("nvs", "nfc", NVS_TYPE_STR);
+
+  File fout = LittleFS.open(ARCHIVO_UIDS, "w");
+  int n = 0;
+
+  while (it != nullptr) {
+    nvs_entry_info_t info;
+    nvs_entry_info(it, &info);  // void en la API 4.x
+    String key = String(info.key);
+    // UID = cadena hex en MAYUSCULAS (0-9, A-F), 6-14 chars.
+    // Ningun key del sistema cumple esta condicion: todos tienen al menos un
+    // caracter minusculo ("buildID", "lastClean", "k"+uid, "emailDest", etc.).
+    bool esUid = (key.length() >= 6 && key.length() <= 14);
+    for (int i = 0; esUid && i < (int)key.length(); i++) {
+      char c = key[i];
+      if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) esUid = false;
+    }
+    if (esUid && fout) { fout.println(key); n++; }
+    it = nvs_entry_next(it);  // retorna NULL al agotar; el iterador queda liberado
+  }
+  if (fout) fout.close();
+  Serial.printf("UIDS: %d usuarios reconstruidos desde NVS\n", n);
+}
+
 String usuariosCsv() {
   String r = "UID,Nombre,Codigo\n";
   File f = LittleFS.open(ARCHIVO_UIDS, "r");
@@ -640,14 +674,16 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
   return ok;
 }
 
-// ── Cierre de dia (medianoche) ────────────────────────────────
-// Ejecuta una sola vez por dia a las 00:xx.
+// ── Cierre de dia ────────────────────────────────────────────
+// Se ejecuta una sola vez por dia (clave NVS lastCierre) en cuanto se detecta
+// un dia nuevo, sin importar la hora. Esto cubre el caso en que el sistema estuvo
+// apagado a medianoche: si arranca a las 09:00 del dia siguiente, cerrarDia corre
+// igual y resetea los contadores antes de la primera lectura real del dia.
 // Para cada UID con contador impar (Entrada sin Salida), agrega "Salida: Pendiente".
 // Luego resetea todos los contadores a 0 para que el nuevo dia empiece desde Entrada.
 void cerrarDia() {
   if (!rtcDisponible) return;
   FechaHora fh = rtcLeerFechaHora();
-  if (fh.hora != 0) return;
 
   char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
   if (almacen.getString("lastCierre", "") == String(hoy)) return;
@@ -1142,6 +1178,7 @@ void setup() {
   // NVS y LittleFS deben inicializarse antes que el RTC (buildID usa NVS)
   almacen.begin("nfc", false);
   LittleFS.begin(true);
+  reconstruirArchivoUids();  // sincronizar ARCHIVO_UIDS con NVS en cada arranque
 
   busRtc.begin(RTC_SDA, RTC_SCL); delay(50);
   rtcDisponible = rtcDs3231.begin(&busRtc);
@@ -1263,8 +1300,8 @@ void loop() {
       String codigo    = almacen.getString(claveCode.c_str(), "");
       almacen.remove(uid.c_str());
       almacen.remove(claveCode.c_str());
-      String claveCont = "c" + uid;
-      almacen.remove(claveCont.c_str());
+      almacen.remove(("c" + uid).c_str());  // contador entrada/salida
+      almacen.remove(("f" + uid).c_str());  // fecha ultimo acceso
       uidEliminar(uid);  // quitar de ARCHIVO_UIDS
       almacen.putString("lastDel", "DELETED|" + uid + "|" + nombre + "|" + codigo);
       Serial.println("[" + ts + "] BORRADO: " + uid + " -> " + nombre);
@@ -1293,11 +1330,30 @@ void loop() {
   String nombre    = almacen.getString(uid.c_str(), "NO_REGISTRADO");
   String claveCode = "k" + uid;
   String codigo    = almacen.getString(claveCode.c_str(), "");
-  // Determinar tipo antes de escribir; escribir archivos antes de actualizar NVS
-  // para que ambos queden consistentes si hay corte de luz entre los dos pasos.
   String claveCont = "c" + uid;
-  int    conteo    = almacen.getInt(claveCont.c_str(), 0) + 1;
-  String tipo      = (conteo % 2 == 1) ? "Entrada" : "Salida";
+
+  // Red de seguridad: si cerrarDia no corrio a medianoche (p.ej. corte de luz),
+  // la primera lectura del nuevo dia detecta el cambio de fecha, resetea el contador
+  // y agrega "Salida: Pendiente" si el dia anterior termino con Entrada sin Salida.
+  // Clave "f"+uid (1+max14=15 chars, dentro del limite NVS) guarda la fecha del ultimo acceso.
+  String claveFecha  = "f" + uid;
+  String fechaUltima = almacen.getString(claveFecha.c_str(), "");
+  String fechaHoy    = (ts.length() >= 10 && ts[0] >= '0' && ts[0] <= '9')
+                       ? ts.substring(0, 10) : "";
+  if (fechaHoy.length() && fechaUltima.length() && fechaUltima != fechaHoy) {
+    int conteoAnterior = almacen.getInt(claveCont.c_str(), 0);
+    if (conteoAnterior % 2 == 1) {
+      entradaAgregar("Pendiente", uid, nombre, codigo, "Salida: Pendiente");
+      Serial.println("NUEVO-DIA: " + uid + " -> Salida pendiente (cerrarDia tardio)");
+    }
+    almacen.putInt(claveCont.c_str(), 0);
+    Serial.println("NUEVO-DIA: " + uid + " -> contador reseteado por cambio de dia");
+  }
+  if (fechaHoy.length()) almacen.putString(claveFecha.c_str(), fechaHoy);
+
+  // Determinar tipo y escribir. Archivos primero, NVS despues (consistencia ante corte).
+  int    conteo = almacen.getInt(claveCont.c_str(), 0) + 1;
+  String tipo   = (conteo % 2 == 1) ? "Entrada" : "Salida";
   logAgregar(ts, uid, nombre, codigo);
   entradaAgregar(ts, uid, nombre, codigo, tipo);
   almacen.putInt(claveCont.c_str(), conteo);
