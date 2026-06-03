@@ -20,7 +20,7 @@
 #define SMTP_HOST        "smtp.gmail.com"
 #define SMTP_PORT        587   // 587=STARTTLS (Gmail recomendado) | 465=SSL implicito
 #define REMITENTE_EMAIL  "dcangrejo37@gmail.com"          // ← Tu cuenta Gmail
-#define REMITENTE_CLAVE  "Lapatapaty1*"         // ← App Password de Gmail (sin espacios)
+#define REMITENTE_CLAVE  "fbxbxldrexrrmfpo"         // ← App Password de Gmail (sin espacios)
 
 TwoWire           busRtc = TwoWire(1);
 Adafruit_PN532    lectorNfc(21, 22);
@@ -492,23 +492,57 @@ void smtpCallback(SMTP_Status status) {
   Serial.print("SMTP cb: "); Serial.println(status.info());
 }
 
+// Convierte "YYYY-MM-DD HH:MM:SS" → "YYYY_MM_DD_HH_MM_SS" para nombres de archivo.
+String tsParaNombre(const String& ts) {
+  String r = ts;
+  r.replace('-', '_');
+  r.replace(' ', '_');
+  r.replace(':', '_');
+  return r;
+}
+
+// Lee el primer y ultimo timestamp valido de un archivo de LittleFS y construye el
+// nombre del adjunto: prefijo_TS1__TS2.csv.  Si el archivo esta vacio: prefijo_sin_datos.csv.
+String nombreAdjunto(const char* rutaArchivo, const char* prefijo) {
+  File f = LittleFS.open(rutaArchivo, "r");
+  if (!f || !f.size()) { if (f) f.close(); return String(prefijo) + "_sin_datos.csv"; }
+  String primero = "", ultimo = "";
+  while (f.available()) {
+    String l = f.readStringUntil('\n'); l.trim();
+    if (!l.length()) continue;
+    int sep = l.indexOf('|');
+    if (sep < 19) continue;  // timestamp minimo 19 chars ("YYYY-MM-DD HH:MM:SS")
+    String ts = l.substring(0, sep);
+    if (!primero.length()) primero = ts;
+    ultimo = ts;
+  }
+  f.close();
+  if (!primero.length()) return String(prefijo) + "_sin_datos.csv";
+  return String(prefijo) + "_" + tsParaNombre(primero) + "__" + tsParaNombre(ultimo) + ".csv";
+}
+
 // Envía ambos CSV como adjuntos al email guardado en NVS.
-// Devuelve true si el envío fue exitoso.
+// borrarTras=true  → solo en envio automatico: borra archivos y actualiza lastEmail en NVS.
+// borrarTras=false → envio manual: los archivos permanecen intactos y lastEmail no cambia.
 // Puerto 587 con STARTTLS (recomendado para Gmail con App Password).
 // IMPORTANTE: REMITENTE_CLAVE debe ser un App Password de 16 chars (sin espacios),
 // no la contraseña normal de la cuenta Gmail.
-bool enviarEmail(const String& csvLog, const String& csvEntradas) {
+bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTras) {
   String destino = almacen.getString("emailDest", "");
   if (!destino.length()) { emailEstado = "Sin destinatario configurado"; return false; }
   if (WiFi.status() != WL_CONNECTED) { emailEstado = "Sin conexion WiFi"; return false; }
 
+  // Generar nombres de adjunto con el rango de timestamps del archivo ANTES de cualquier borrado.
+  String nomLog = nombreAdjunto(ARCHIVO_LOG, "accesos");
+  String nomEnt = nombreAdjunto(ARCHIVO_ENT, "entradas");
+
   String fechaHoy = rtcDisponible ? obtenerTimestamp().substring(0, 10) : "sin-fecha";
   String asunto   = "Registros NFC - " + fechaHoy;
-  String cuerpo   = "Reporte automatico del sistema NFC.\n"
+  String cuerpo   = "Reporte " + String(borrarTras ? "automatico" : "manual") + " del sistema NFC.\n"
                     "Fecha: " + fechaHoy + "\n\n"
                     "Adjuntos:\n"
-                    "  - accesos.csv  : log de accesos por tarjeta\n"
-                    "  - entradas.csv : registro de entradas y salidas\n";
+                    "  - " + nomLog + "  : log de accesos por tarjeta\n"
+                    "  - " + nomEnt + " : registro de entradas y salidas\n";
 
   Session_Config config;
   config.server.host_name  = SMTP_HOST;
@@ -532,7 +566,7 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas) {
   message.text.charSet = F("utf-8");
 
   SMTP_Attachment attLog;
-  attLog.descr.name              = F("accesos.csv");
+  attLog.descr.name              = nomLog.c_str();
   attLog.descr.mime              = F("text/csv");
   attLog.descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
   attLog.blob.data               = (uint8_t*)csvLog.c_str();
@@ -540,7 +574,7 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas) {
   message.addAttachment(attLog);
 
   SMTP_Attachment attEnt;
-  attEnt.descr.name              = F("entradas.csv");
+  attEnt.descr.name              = nomEnt.c_str();
   attEnt.descr.mime              = F("text/csv");
   attEnt.descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
   attEnt.blob.data               = (uint8_t*)csvEntradas.c_str();
@@ -553,6 +587,7 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas) {
   Serial.printf("SMTP: conectando a %s:%d startTLS=%d remitente=%s dest=%s\n",
     SMTP_HOST, SMTP_PORT, (SMTP_PORT == 587),
     REMITENTE_EMAIL, destino.c_str());
+  Serial.printf("SMTP: adjuntos -> \"%s\" \"%s\"\n", nomLog.c_str(), nomEnt.c_str());
   emailEstado = "Conectando a " + String(SMTP_HOST) + ":" + String(SMTP_PORT) + "...";
 
   if (!smtp.connect(&config)) {
@@ -569,6 +604,17 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas) {
     emailEstado   = "Enviado OK - " + (rtcDisponible ? obtenerTimestamp() : fechaHoy);
     emailUltimoTs = emailEstado.substring(emailEstado.indexOf('-') + 2);
     Serial.println("SMTP: envio EXITOSO");
+    if (borrarTras) {
+      LittleFS.remove(ARCHIVO_LOG);
+      LittleFS.remove(ARCHIVO_ENT);
+      // Actualizar lastEmail con la fecha de hoy para evitar reenvio automatico el mismo dia
+      if (rtcDisponible) {
+        FechaHora fh = rtcLeerFechaHora();
+        char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
+        almacen.putString("lastEmail", String(hoy));
+      }
+      Serial.println("EMAIL-AUTO: archivos borrados y lastEmail actualizado.");
+    }
   } else {
     emailEstado = "Error envio: " + smtp.errorReason();
     Serial.println("SMTP envio FALLO: " + smtp.errorReason());
@@ -597,10 +643,8 @@ void autoEnviarEmail() {
   String csvLog = logCsv();
   String csvEnt = entradaCsv();
 
-  if (enviarEmail(csvLog, csvEnt)) {
-    LittleFS.remove(ARCHIVO_LOG);
-    LittleFS.remove(ARCHIVO_ENT);
-    almacen.putString("lastEmail", String(hoy));
+  // borrarTras=true: al enviar automaticamente se borran archivos y se actualiza lastEmail.
+  if (enviarEmail(csvLog, csvEnt, true)) {
     Serial.println("AUTO-EMAIL enviado: " + String(hoy));
   } else {
     Serial.println("AUTO-EMAIL error: no se pudo enviar.");
@@ -968,17 +1012,16 @@ void handleSendEmail() {
 
   String csvLog = logCsv();
   String csvEnt = entradaCsv();
-  bool ok = enviarEmail(csvLog, csvEnt);
+  // borrarTras=false: el envio manual NO borra archivos ni actualiza lastEmail.
+  bool ok = enviarEmail(csvLog, csvEnt, false);
 
   if (ok) {
-    String hoy = rtcDisponible ? obtenerTimestamp().substring(0, 10) : "";
-    if (hoy.length()) almacen.putString("lastEmail", hoy);
-    LittleFS.remove(ARCHIVO_LOG);
-    LittleFS.remove(ARCHIVO_ENT);
     servidor.send(200, "text/html", pagina("Email enviado",
       "<h2>&#10003; Email enviado</h2><div class='card'>"
       "<p>Archivos enviados a <b>" + destino + "</b>.</p>"
-      "<p class='muted'>Los archivos de log y entradas han sido borrados.</p>"
+      "<p class='muted'>Los archivos de log y entradas <b>NO han sido borrados</b> "
+      "(envio manual).</p>"
+      "<a href='/logs'><button>Ver logs</button></a> "
       "<a href='/'><button>Inicio</button></a></div>"));
   } else {
     servidor.send(200, "text/html", pagina("Error al enviar",
