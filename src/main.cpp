@@ -19,8 +19,8 @@
 // ── Credenciales SMTP del remitente (cambiar antes de compilar) ──
 #define SMTP_HOST        "smtp.gmail.com"
 #define SMTP_PORT        465
-#define REMITENTE_EMAIL  "tu_cuenta@gmail.com"          // ← Tu cuenta Gmail
-#define REMITENTE_CLAVE  "xxxxxxxxxxxxxxxxxxxx"         // ← App Password de Gmail (sin espacios)
+#define REMITENTE_EMAIL  "dcangrejo37@gmail.com"          // ← Tu cuenta Gmail
+#define REMITENTE_CLAVE  "Lapatapaty1*"         // ← App Password de Gmail (sin espacios)
 
 TwoWire           busRtc = TwoWire(1);
 Adafruit_PN532    lectorNfc(21, 22);
@@ -37,15 +37,21 @@ String codigoPendiente      = "";
 bool   esperandoTarjeta     = false;
 bool   modoEliminar         = false;
 bool   resultadoEliminacion = false;
-String ultimoUid            = "";
-bool   tarjetaPresente      = false;
+String        ultimoUid        = "";
+bool          tarjetaPresente  = false;
+unsigned long tiempoUltimoUid  = 0;    // ms del último UID procesado con éxito
 
 unsigned long ultimaLecturaNfc      = 0;
 unsigned long ultimoChequeoLimpieza = 0;
 unsigned long ultimaReconexionWifi  = 0;
-const unsigned long INTERVALO_NFC      = 300;
-const unsigned long INTERVALO_LIMPIEZA = 60000;
-const unsigned long INTERVALO_WIFI     = 30000;
+const unsigned long INTERVALO_NFC       = 300;
+const unsigned long INTERVALO_LIMPIEZA  = 60000;
+const unsigned long INTERVALO_WIFI      = 30000;
+// Tiempo mínimo entre dos lecturas válidas del mismo UID.
+// Protege contra: (a) doble lectura por fallo I2C transitorio que resetea
+// tarjetaPresente mientras la tarjeta sigue físicamente cerca; (b) taps
+// involuntarios en rápida sucesión.
+const unsigned long COOLDOWN_TARJETA = 3000;
 bool rtcDisponible = false;
 
 // Timer no bloqueante para volver al mensaje idle tras mostrar un nombre
@@ -588,6 +594,9 @@ void handleSaveName() {
     servidor.send(400, "text/plain", "Codigo invalido (1-6 caracteres)"); return;
   }
   esperandoTarjeta = true; modoEliminar = false;
+  // Resetear estado NFC para que cualquier tarjeta sea aceptada inmediatamente,
+  // sin que el cooldown o tarjetaPresente bloqueen la tarjeta que se va a registrar.
+  tarjetaPresente = false; ultimoUid = ""; tiempoUltimoUid = 0;
   lcdMostrar("Registrando:", nombrePendiente, "Acerca tarjeta", "");
   servidor.send(200, "text/html", pagina("Acerca la tarjeta",
     "<h2>Acerca la tarjeta</h2><div class='card'>"
@@ -602,6 +611,9 @@ void handleSaveName() {
 
 void handleDeleteUser() {
   esperandoTarjeta = false; modoEliminar = true; nombrePendiente = ""; codigoPendiente = "";
+  // Resetear estado NFC igual que en registro: cualquier tarjeta debe ser detectada
+  // inmediatamente sin importar si ya fue leída antes en este ciclo.
+  tarjetaPresente = false; ultimoUid = ""; tiempoUltimoUid = 0;
   lcdMostrar("Modo eliminar", "Acerca tarjeta", "", "");
   servidor.send(200, "text/html", pagina("Borrar usuario",
     "<h2>Borrar usuario</h2><div class='card' style='border-color:#dc3545'>"
@@ -700,6 +712,9 @@ void handleCancelar() {
   modoEliminar     = false;
   nombrePendiente  = "";
   codigoPendiente  = "";
+  // Resetear estado NFC al cancelar para que la siguiente lectura normal funcione sin
+  // cooldown residual de una operación de registro/eliminación que fue cancelada.
+  tarjetaPresente = false; ultimoUid = ""; tiempoUltimoUid = 0;
   lcdMostrar("Cancelado", "", "", "");
   servidor.send(200, "text/html", pagina("Cancelado",
     "<h2>Operacion cancelada</h2><div class='card'>"
@@ -849,12 +864,34 @@ String uidAHex(byte* uid, byte longitud) {
 bool leerUidUnaVez(String &uidSalida) {
   byte uid[7]; byte longitud = 0;
   if (!lectorNfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &longitud, 50)) {
-    if (tarjetaPresente) { tarjetaPresente = false; ultimoUid = ""; Serial.println("Tarjeta retirada"); }
+    if (tarjetaPresente) {
+      tarjetaPresente = false;
+      Serial.println("Tarjeta retirada");
+      // ultimoUid NO se borra: el cooldown por tiempo sigue protegiendo contra
+      // re-lecturas causadas por pérdida I2C transitoria del PN532 mientras la
+      // tarjeta sigue físicamente cerca del lector.
+    }
     return false;
   }
+
   String hex = uidAHex(uid, longitud);
-  if (tarjetaPresente && hex == ultimoUid) return false;
-  tarjetaPresente = true; ultimoUid = uidSalida = hex; return true;
+  unsigned long ahora = millis();
+
+  // Doble condición de anti-repetición:
+  //   1. Mismo UID y tarjeta físicamente presente (tarjetaPresente = true).
+  //   2. O mismo UID y no han pasado COOLDOWN_TARJETA ms desde la última lectura válida.
+  // Cualquiera de las dos condiciones bloquea una segunda lectura del mismo UID.
+  // Esto cubre el caso de fallo I2C transitorio que pone tarjetaPresente=false
+  // brevemente mientras la tarjeta sigue sobre el lector.
+  if (hex == ultimoUid && (tarjetaPresente || (ahora - tiempoUltimoUid < COOLDOWN_TARJETA))) {
+    tarjetaPresente = true;  // mantener estado coherente
+    return false;
+  }
+
+  tarjetaPresente = true;
+  ultimoUid       = uidSalida = hex;
+  tiempoUltimoUid = ahora;
+  return true;
 }
 
 // ── Setup & Loop ─────────────────────────────────────────────
