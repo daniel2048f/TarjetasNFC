@@ -565,8 +565,12 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
   message.text.content = cuerpo.c_str();
   message.text.charSet = F("utf-8");
 
+  // descr.name  → parámetro "name"     en Content-Type (referencia interna del mensaje).
+  // descr.filename → parámetro "filename" en Content-Disposition (nombre visible en el adjunto).
+  // Ambos deben asignarse; sin descr.filename la librería deja el adjunto sin nombre ("noname").
   SMTP_Attachment attLog;
   attLog.descr.name              = nomLog.c_str();
+  attLog.descr.filename          = nomLog.c_str();
   attLog.descr.mime              = F("text/csv");
   attLog.descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
   attLog.blob.data               = (uint8_t*)csvLog.c_str();
@@ -575,6 +579,7 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
 
   SMTP_Attachment attEnt;
   attEnt.descr.name              = nomEnt.c_str();
+  attEnt.descr.filename          = nomEnt.c_str();
   attEnt.descr.mime              = F("text/csv");
   attEnt.descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
   attEnt.blob.data               = (uint8_t*)csvEntradas.c_str();
@@ -832,8 +837,8 @@ void handleClearLogs() {
 }
 
 void handleDownloadLogs() {
-  String ts = rtcDisponible ? obtenerTimestamp().substring(0, 10) : "logs";
-  servidor.sendHeader("Content-Disposition", "attachment; filename=\"accesos_" + ts + ".csv\"");
+  String nombre = nombreAdjunto(ARCHIVO_LOG, "accesos");
+  servidor.sendHeader("Content-Disposition", "attachment; filename=\"" + nombre + "\"");
   servidor.send(200, "text/csv; charset=utf-8", logCsv());
 }
 
@@ -866,8 +871,8 @@ void handleEntradas() {
 }
 
 void handleDownloadEntradas() {
-  String ts = rtcDisponible ? obtenerTimestamp().substring(0, 10) : "entradas";
-  servidor.sendHeader("Content-Disposition", "attachment; filename=\"entradas_" + ts + ".csv\"");
+  String nombre = nombreAdjunto(ARCHIVO_ENT, "entradas");
+  servidor.sendHeader("Content-Disposition", "attachment; filename=\"" + nombre + "\"");
   servidor.send(200, "text/csv; charset=utf-8", entradaCsv());
 }
 
