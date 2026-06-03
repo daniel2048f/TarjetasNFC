@@ -18,7 +18,7 @@
 
 // ── Credenciales SMTP del remitente (cambiar antes de compilar) ──
 #define SMTP_HOST        "smtp.gmail.com"
-#define SMTP_PORT        465
+#define SMTP_PORT        587   // 587=STARTTLS (Gmail recomendado) | 465=SSL implicito
 #define REMITENTE_EMAIL  "dcangrejo37@gmail.com"          // ← Tu cuenta Gmail
 #define REMITENTE_CLAVE  "Lapatapaty1*"         // ← App Password de Gmail (sin espacios)
 
@@ -53,6 +53,16 @@ const unsigned long INTERVALO_WIFI      = 30000;
 // involuntarios en rápida sucesión.
 const unsigned long COOLDOWN_TARJETA = 3000;
 bool rtcDisponible = false;
+
+// ── Estado NTP ───────────────────────────────────────────────
+bool          ntpPendiente      = false;
+String        ntpEstado         = "No sincronizado";
+unsigned long ultimaNtpSync     = 0;
+bool          wifiConectadoPrev = false;
+
+// ── Estado email ─────────────────────────────────────────────
+String emailEstado   = "Sin intentos";
+String emailUltimoTs = "";
 
 // Timer no bloqueante para volver al mensaje idle tras mostrar un nombre
 unsigned long tiempoLcdHasta = 0;
@@ -422,16 +432,75 @@ String entradaCsv() {
   return resultado;
 }
 
+// ── NTP ──────────────────────────────────────────────────────
+// Aplica la hora obtenida de NTP al RTC y actualiza el estado global.
+void aplicarTiempoNtp(struct tm& info) {
+  int anio = info.tm_year + 1900;
+  int mes  = info.tm_mon  + 1;
+  int dia  = info.tm_mday;
+  int hora = info.tm_hour;
+  int min  = info.tm_min;
+  int seg  = info.tm_sec;
+  if (anio < 2024 || anio > 2099) {
+    ntpEstado = "NTP: anio invalido (" + String(anio) + ")";
+    Serial.println(ntpEstado);
+    return;
+  }
+  if (rtcDisponible) rtcAjustarHora(anio, mes, dia, hora, min, seg);
+  ultimaNtpSync = millis();
+  ntpEstado = "Sincronizado: " + obtenerTimestamp();
+  Serial.println("NTP OK -> " + ntpEstado);
+}
+
+// Inicia sincronizacion NTP de forma no bloqueante.
+// El resultado se aplica en verificarNtpPendiente() desde loop().
+void iniciarNtp() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  long offset = almacen.getInt("ntpOffset", -18000);  // UTC-5 Colombia por defecto
+  configTime(offset, 0, "pool.ntp.org", "time.nist.gov");
+  ntpPendiente = true;
+  ntpEstado    = "Sincronizando...";
+  Serial.printf("NTP: configurado offset=%lds, esperando respuesta...\n", offset);
+}
+
+// Llama desde loop(): si el NTP ya respondio, aplica la hora al RTC.
+void verificarNtpPendiente() {
+  if (!ntpPendiente) return;
+  struct tm info;
+  if (!getLocalTime(&info, 0)) return;  // aun no hay respuesta
+  ntpPendiente = false;
+  aplicarTiempoNtp(info);
+}
+
+// Sincronizacion bloqueante (max 10 s) para solicitud manual del usuario.
+bool sincronizarNtpManual() {
+  if (WiFi.status() != WL_CONNECTED) { ntpEstado = "Sin WiFi"; return false; }
+  long offset = almacen.getInt("ntpOffset", -18000);
+  configTime(offset, 0, "pool.ntp.org", "time.nist.gov");
+  struct tm info;
+  unsigned long inicio = millis();
+  while (millis() - inicio < 10000) {
+    if (getLocalTime(&info, 500)) { ntpPendiente = false; aplicarTiempoNtp(info); return true; }
+  }
+  ntpEstado = "NTP: timeout (10 s)";
+  Serial.println(ntpEstado);
+  return false;
+}
+
 // ── Email ─────────────────────────────────────────────────────
 void smtpCallback(SMTP_Status status) {
-  Serial.print("SMTP: "); Serial.println(status.info());
+  Serial.print("SMTP cb: "); Serial.println(status.info());
 }
 
 // Envía ambos CSV como adjuntos al email guardado en NVS.
 // Devuelve true si el envío fue exitoso.
+// Puerto 587 con STARTTLS (recomendado para Gmail con App Password).
+// IMPORTANTE: REMITENTE_CLAVE debe ser un App Password de 16 chars (sin espacios),
+// no la contraseña normal de la cuenta Gmail.
 bool enviarEmail(const String& csvLog, const String& csvEntradas) {
   String destino = almacen.getString("emailDest", "");
-  if (!destino.length() || WiFi.status() != WL_CONNECTED) return false;
+  if (!destino.length()) { emailEstado = "Sin destinatario configurado"; return false; }
+  if (WiFi.status() != WL_CONNECTED) { emailEstado = "Sin conexion WiFi"; return false; }
 
   String fechaHoy = rtcDisponible ? obtenerTimestamp().substring(0, 10) : "sin-fecha";
   String asunto   = "Registros NFC - " + fechaHoy;
@@ -442,14 +511,16 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas) {
                     "  - entradas.csv : registro de entradas y salidas\n";
 
   Session_Config config;
-  config.server.host_name = SMTP_HOST;
-  config.server.port      = SMTP_PORT;
-  config.login.email      = REMITENTE_EMAIL;
-  config.login.password   = REMITENTE_CLAVE;
+  config.server.host_name  = SMTP_HOST;
+  config.server.port       = SMTP_PORT;
+  config.login.email       = REMITENTE_EMAIL;
+  config.login.password    = REMITENTE_CLAVE;
   config.login.user_domain = "";
-  // NTP para que TLS pueda validar certificados; se usa si el reloj del sistema no está sincronizado
-  config.time.ntp_server    = F("pool.ntp.org,time.nist.gov");
-  config.time.gmt_offset    = 0;
+  // STARTTLS (port 587) o SSL implicito (port 465)
+  config.secure.startTLS   = (SMTP_PORT == 587);
+  // NTP interno de la libreria como respaldo para validar certificados TLS
+  config.time.ntp_server       = F("pool.ntp.org,time.nist.gov");
+  config.time.gmt_offset       = almacen.getInt("ntpOffset", -18000);
   config.time.day_light_offset = 0;
 
   SMTP_Message message;
@@ -457,8 +528,8 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas) {
   message.sender.email = REMITENTE_EMAIL;
   message.subject      = asunto.c_str();
   message.addRecipient(F("Destino"), destino.c_str());
-  message.text.content  = cuerpo.c_str();
-  message.text.charSet  = F("utf-8");
+  message.text.content = cuerpo.c_str();
+  message.text.charSet = F("utf-8");
 
   SMTP_Attachment attLog;
   attLog.descr.name              = F("accesos.csv");
@@ -466,7 +537,6 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas) {
   attLog.descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
   attLog.blob.data               = (uint8_t*)csvLog.c_str();
   attLog.blob.size               = csvLog.length();
-  attLog.file.storage_type       = esp_mail_file_storage_type_none;
   message.addAttachment(attLog);
 
   SMTP_Attachment attEnt;
@@ -475,18 +545,34 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas) {
   attEnt.descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
   attEnt.blob.data               = (uint8_t*)csvEntradas.c_str();
   attEnt.blob.size               = csvEntradas.length();
-  attEnt.file.storage_type       = esp_mail_file_storage_type_none;
   message.addAttachment(attEnt);
 
-  smtp.debug(0);
+  smtp.debug(1);  // log completo por Serial de todo el dialogo SMTP
   smtp.callback(smtpCallback);
 
+  Serial.printf("SMTP: conectando a %s:%d startTLS=%d remitente=%s dest=%s\n",
+    SMTP_HOST, SMTP_PORT, (SMTP_PORT == 587),
+    REMITENTE_EMAIL, destino.c_str());
+  emailEstado = "Conectando a " + String(SMTP_HOST) + ":" + String(SMTP_PORT) + "...";
+
   if (!smtp.connect(&config)) {
-    Serial.printf("SMTP conexion error: %s\n", smtp.errorReason().c_str());
+    emailEstado = "Error conexion: " + smtp.errorReason();
+    Serial.println("SMTP conexion FALLO: " + smtp.errorReason());
+    smtp.closeSession();
     return false;
   }
+  Serial.println("SMTP: conexion OK. Autenticando y enviando...");
+  emailEstado = "Enviando mensaje...";
+
   bool ok = MailClient.sendMail(&smtp, &message, true);
-  if (!ok) Serial.printf("SMTP envio error: %s\n", smtp.errorReason().c_str());
+  if (ok) {
+    emailEstado   = "Enviado OK - " + (rtcDisponible ? obtenerTimestamp() : fechaHoy);
+    emailUltimoTs = emailEstado.substring(emailEstado.indexOf('-') + 2);
+    Serial.println("SMTP: envio EXITOSO");
+  } else {
+    emailEstado = "Error envio: " + smtp.errorReason();
+    Serial.println("SMTP envio FALLO: " + smtp.errorReason());
+  }
   smtp.closeSession();
   return ok;
 }
@@ -753,7 +839,7 @@ void handleClearEntradas() {
     "<a href='/'><button>Inicio</button></a></div>"));
 }
 
-// ── Handler: Configuracion WiFi + email ──────────────────────
+// ── Handler: Configuracion WiFi + NTP + email ────────────────
 void handleConfig() {
   String ssidGuardado  = almacen.getString("ssidWifi",  "");
   String emailGuardado = almacen.getString("emailDest", "");
@@ -762,8 +848,28 @@ void handleConfig() {
     ? "<span style='color:#28a745'>Conectado &mdash; " + WiFi.localIP().toString() + "</span>"
     : "<span style='color:#dc3545'>Desconectado</span>";
 
+  // Offset NTP actual en horas (guardado en segundos)
+  long   offsetSec = almacen.getInt("ntpOffset", -18000);
+  String offsetHStr = String(offsetSec / 3600);
+
+  // Tiempo desde ultimo sync NTP
+  String ntpSyncStr = "Nunca";
+  if (ultimaNtpSync > 0) {
+    unsigned long segs = (millis() - ultimaNtpSync) / 1000;
+    if (segs < 60)       ntpSyncStr = "hace " + String(segs) + " s";
+    else if (segs < 3600) ntpSyncStr = "hace " + String(segs/60) + " min";
+    else                  ntpSyncStr = "hace " + String(segs/3600) + " h";
+  }
+
+  // Color estado email
+  String emailColor = "#666";
+  if (emailEstado.startsWith("Enviado")) emailColor = "#28a745";
+  else if (emailEstado.startsWith("Error")) emailColor = "#dc3545";
+
   servidor.send(200, "text/html", pagina("Configuracion",
     "<h2>&#9881; Configuracion</h2>"
+
+    // ── WiFi ──
     "<div class='card'><h3>Red WiFi con internet</h3>"
     "<p>Estado: " + estadoWifi + "</p>"
     "<form method='POST' action='/saveConfig'>"
@@ -773,10 +879,30 @@ void handleConfig() {
     "<input type='password' name='clave' placeholder='(en blanco = no cambiar)'><br><br>"
     "<label>Email destino para reportes:</label><br>"
     "<input type='email' name='email' value='" + emailGuardado + "' placeholder='destino@ejemplo.com'><br><br>"
+    "<label>Zona horaria (offset UTC en horas, ej: -5 para Colombia):</label><br>"
+    "<input type='number' name='ntpOffsetH' min='-12' max='14' value='" + offsetHStr + "'><br><br>"
     "<button type='submit'>&#10003; Guardar y reconectar</button></form>"
-    "<p class='muted'>Ultimo envio automatico: " + ultimoEmail + "</p>"
-    "<p class='muted'>Los reportes se envian automaticamente los dias 10, 20 y ultimo del mes a medianoche.</p>"
+    "<p class='muted'>Ultimo envio automatico de correo: " + ultimoEmail + "</p>"
+    "<p class='muted'>Reportes automaticos los dias 10, 20 y ultimo del mes a medianoche.</p>"
     "</div>"
+
+    // ── NTP ──
+    "<div class='card'><h3>&#128336; Sincronizacion NTP</h3>"
+    "<p>Estado: <b>" + ntpEstado + "</b></p>"
+    "<p class='muted'>Ultima sincronizacion: " + ntpSyncStr + "</p>"
+    "<a href='/syncNtp'><button class='btn-ok'>&#8635; Sincronizar hora por NTP ahora</button></a>"
+    "</div>"
+
+    // ── Email ──
+    "<div class='card'><h3>&#128231; Estado del correo</h3>"
+    "<p>Ultimo intento: <b style='color:" + emailColor + "'>" + emailEstado + "</b></p>"
+    "<p class='muted'>Host SMTP: " + String(SMTP_HOST) + ":" + String(SMTP_PORT)
+    + " (startTLS=" + (SMTP_PORT == 587 ? "si" : "no") + ")</p>"
+    "<p class='muted'>Remitente: " + String(REMITENTE_EMAIL) + "</p>"
+    "<p class='muted'>IMPORTANTE: la clave SMTP debe ser un App Password de Google"
+    " (16 caracteres, sin espacios), NO la contrasena normal de Gmail.</p>"
+    "</div>"
+
     "<a href='/'><button>Volver</button></a>"));
 }
 
@@ -789,6 +915,15 @@ void handleSaveConfig() {
   if (ssid.length())  almacen.putString("ssidWifi",  ssid.c_str());
   if (clave.length()) almacen.putString("claveWifi", clave.c_str());
   if (email.length()) almacen.putString("emailDest", email.c_str());
+
+  // Guardar offset de zona horaria NTP
+  if (servidor.hasArg("ntpOffsetH")) {
+    long offsetH   = servidor.arg("ntpOffsetH").toInt();
+    if (offsetH >= -12 && offsetH <= 14) {
+      almacen.putInt("ntpOffset", (int)(offsetH * 3600));
+      Serial.printf("NTP: zona horaria guardada UTC%+ld\n", offsetH);
+    }
+  }
 
   // Reconectar STA con las nuevas credenciales
   if (ssid.length()) {
@@ -853,6 +988,25 @@ void handleSendEmail() {
       "<p class='muted'>Los archivos NO fueron borrados.</p>"
       "<a href='/logs'><button>Volver a logs</button></a></div>"));
   }
+}
+
+// ── Handler: Sincronizacion NTP manual ───────────────────────
+void handleSyncNtp() {
+  if (WiFi.status() != WL_CONNECTED) {
+    servidor.send(200, "text/html", pagina("Sin WiFi",
+      "<h2>Sin conexion WiFi</h2><div class='card'>"
+      "<p>Conecte el WiFi en <a href='/config'>Configuracion</a> primero.</p>"
+      "<a href='/config'><button>Volver</button></a></div>"));
+    return;
+  }
+  bool ok = sincronizarNtpManual();
+  String color = ok ? "#28a745" : "#dc3545";
+  String icono = ok ? "&#10003;" : "&#10060;";
+  servidor.send(200, "text/html", pagina("Sincronizacion NTP",
+    "<h2>" + String(icono) + " NTP</h2><div class='card'>"
+    "<p style='color:" + color + ";font-weight:bold'>" + ntpEstado + "</p>"
+    "<p class='ts'>Hora actual: " + (rtcDisponible ? obtenerTimestamp() : "RTC no disponible") + "</p>"
+    "<a href='/config'><button>Volver</button></a></div>"));
 }
 
 // ── NFC ──────────────────────────────────────────────────────
@@ -965,6 +1119,7 @@ void setup() {
   servidor.on("/config",           handleConfig);
   servidor.on("/saveConfig",       HTTP_POST, handleSaveConfig);
   servidor.on("/sendEmail",        handleSendEmail);
+  servidor.on("/syncNtp",          handleSyncNtp);
   servidor.begin();
   Serial.println("Servidor web iniciado!");
 
@@ -982,10 +1137,21 @@ void loop() {
     else                     lcdMostrar("Listo", "", "", "");
   }
 
+  // Detectar cambio de estado WiFi: lanzar NTP al conectarse
+  bool wifiAhora = (WiFi.status() == WL_CONNECTED);
+  if (wifiAhora && !wifiConectadoPrev) {
+    Serial.println("WiFi: conexion establecida. Iniciando NTP...");
+    iniciarNtp();
+  }
+  wifiConectadoPrev = wifiAhora;
+
+  // Verificar si el NTP ya respondio y aplicar hora al RTC
+  verificarNtpPendiente();
+
   // Monitorear WiFi STA: reintentar conexión si se pierde
   if (ahora - ultimaReconexionWifi >= INTERVALO_WIFI) {
     ultimaReconexionWifi = ahora;
-    if (WiFi.status() != WL_CONNECTED) {
+    if (!wifiAhora) {
       String ssid = almacen.getString("ssidWifi", "");
       if (ssid.length()) {
         String clave = almacen.getString("claveWifi", "");
@@ -1035,8 +1201,12 @@ void loop() {
 
   if (esperandoTarjeta) {
     String claveCode = "k" + uid;
+    String claveCont = "c" + uid;
     almacen.putString(uid.c_str(), nombrePendiente);
     almacen.putString(claveCode.c_str(), codigoPendiente);
+    // Resetear el contador de Entrada/Salida al registrar (o re-registrar) una tarjeta,
+    // para que la primera pasada tras el registro siempre sea "Entrada".
+    almacen.putInt(claveCont.c_str(), 0);
     almacen.putString("lastReg", "OK|" + uid + "|" + nombrePendiente + "|" + codigoPendiente + "|" + ts);
     Serial.println("[" + ts + "] REGISTRADO: " + uid + " -> " + nombrePendiente + " (" + codigoPendiente + ")");
     lcdMostrarNombre(nombrePendiente, codigoPendiente);
@@ -1049,15 +1219,16 @@ void loop() {
   String nombre = almacen.getString(uid.c_str(), "NO_REGISTRADO");
   String claveCode = "k" + uid;
   String codigo = almacen.getString(claveCode.c_str(), "");
-  logAgregar(ts, uid, nombre, codigo);
 
-  // Conteo persistente en NVS: impar = Entrada, par = Salida
-  // Clave "c" + uid (máx 1+14 = 15 chars, dentro del límite de NVS)
+  // Determinar tipo ANTES de escribir, y escribir ambos archivos ANTES de
+  // actualizar el contador NVS: si hay corte de luz entre los dos pasos,
+  // los archivos quedan consistentes entre si y el contador se puede recalcular.
   String claveCont = "c" + uid;
   int conteo = almacen.getInt(claveCont.c_str(), 0) + 1;
-  almacen.putInt(claveCont.c_str(), conteo);
   String tipo = (conteo % 2 == 1) ? "Entrada" : "Salida";
+  logAgregar(ts, uid, nombre, codigo);
   entradaAgregar(ts, uid, nombre, codigo, tipo);
+  almacen.putInt(claveCont.c_str(), conteo);  // actualizar despues de ambas escrituras
 
   Serial.println("[" + ts + "] " + tipo + ": " + uid + " -> " + nombre);
   lcdMostrarNombre(nombre, codigo);
