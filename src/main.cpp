@@ -7,22 +7,24 @@
 #include <Adafruit_PN532.h>
 #include <LiquidCrystal_I2C.h>
 #include <ESP_Mail_Client.h>
+#include <RTClib.h>
 
 // ── Hardware ──────────────────────────────────────────────────
-// I2C: busRtc(SDA=19,SCL=18)→RTC SD3078 | Wire(SDA=21,SCL=22)→PN532+LCD(0x27)
-#define RTC_SDA        19
-#define RTC_SCL        18
-#define RTC_DIRECCION  0x32
-#define ARCHIVO_LOG    "/logs.txt"
-#define ARCHIVO_ENT    "/entradas.txt"
+// I2C: busRtc(SDA=19,SCL=18)→RTC DS3231 | Wire(SDA=21,SCL=22)→PN532+LCD(0x27)
+#define RTC_SDA       19
+#define RTC_SCL       18
+#define ARCHIVO_LOG   "/logs.txt"
+#define ARCHIVO_ENT   "/entradas.txt"
+#define ARCHIVO_UIDS  "/uids.txt"
 
 // ── Credenciales SMTP del remitente (cambiar antes de compilar) ──
 #define SMTP_HOST        "smtp.gmail.com"
 #define SMTP_PORT        587   // 587=STARTTLS (Gmail recomendado) | 465=SSL implicito
-#define REMITENTE_EMAIL  "dcangrejo37@gmail.com"          // ← Tu cuenta Gmail
-#define REMITENTE_CLAVE  "fbxbxldrexrrmfpo"         // ← App Password de Gmail (sin espacios)
+#define REMITENTE_EMAIL  "rafael.arias@institutotebaida.edu.co"
+#define REMITENTE_CLAVE  "dqanxyjsspeotimc"  // App Password de Gmail (16 chars, sin espacios)
 
 TwoWire           busRtc = TwoWire(1);
+RTC_DS3231        rtcDs3231;
 Adafruit_PN532    lectorNfc(21, 22);
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
@@ -39,7 +41,7 @@ bool   modoEliminar         = false;
 bool   resultadoEliminacion = false;
 String        ultimoUid        = "";
 bool          tarjetaPresente  = false;
-unsigned long tiempoUltimoUid  = 0;    // ms del último UID procesado con éxito
+unsigned long tiempoUltimoUid  = 0;
 
 unsigned long ultimaLecturaNfc      = 0;
 unsigned long ultimoChequeoLimpieza = 0;
@@ -47,10 +49,7 @@ unsigned long ultimaReconexionWifi  = 0;
 const unsigned long INTERVALO_NFC       = 300;
 const unsigned long INTERVALO_LIMPIEZA  = 60000;
 const unsigned long INTERVALO_WIFI      = 30000;
-// Tiempo mínimo entre dos lecturas válidas del mismo UID.
-// Protege contra: (a) doble lectura por fallo I2C transitorio que resetea
-// tarjetaPresente mientras la tarjeta sigue físicamente cerca; (b) taps
-// involuntarios en rápida sucesión.
+// Tiempo minimo entre dos lecturas validas del mismo UID (anti-rebote + cooldown).
 const unsigned long COOLDOWN_TARJETA = 3000;
 bool rtcDisponible = false;
 
@@ -64,10 +63,49 @@ bool          wifiConectadoPrev = false;
 String emailEstado   = "Sin intentos";
 String emailUltimoTs = "";
 
-// Timer no bloqueante para volver al mensaje idle tras mostrar un nombre
+// ── Timer LCD no bloqueante ───────────────────────────────────
 unsigned long tiempoLcdHasta = 0;
 enum LcdPost { LCD_IDLE, LCD_LISTO };
 LcdPost lcdPost = LCD_IDLE;
+
+// ── Proteccion LCD: titileo no bloqueante en estado idle ──────
+// Despues de LCD_IDLE_BLINK_INICIO ms sin actividad, el backlight parpadea
+// brevemente cada 30 s para reducir el desgaste del panel.
+// Solo ocurre en idle; cualquier lectura NFC lo cancela (lcdWakeUp).
+bool          lcdBacklightOn  = true;
+unsigned long lcdIdleDesde    = 0;     // millis() al entrar en idle; 0 = no idle
+unsigned long lcdParpadeoNext = 0;     // proxima inversion del backlight
+const unsigned long LCD_IDLE_BLINK_INICIO = 120000UL; // 2 min idle antes de titular
+const unsigned long LCD_BLINK_ON_MS       = 27000UL;  // 27 s con luz encendida
+const unsigned long LCD_BLINK_OFF_MS      = 3000UL;   // 3 s con luz apagada
+
+// Cancela el modo idle y garantiza backlight encendido.
+// Llamar antes de mostrar cualquier informacion activa en la LCD.
+void lcdWakeUp() {
+  lcdIdleDesde    = 0;
+  lcdParpadeoNext = 0;
+  if (!lcdBacklightOn) { lcd.backlight(); lcdBacklightOn = true; }
+}
+
+// Llama desde loop() en cada iteracion para gestionar el parpadeo.
+void lcdActualizarParpadeo() {
+  if (!lcdIdleDesde) return;
+  unsigned long ahora = millis();
+  if (ahora - lcdIdleDesde < LCD_IDLE_BLINK_INICIO) {
+    if (!lcdBacklightOn) { lcd.backlight(); lcdBacklightOn = true; }
+    return;
+  }
+  if (!lcdParpadeoNext) lcdParpadeoNext = ahora + LCD_BLINK_ON_MS;
+  if (ahora >= lcdParpadeoNext) {
+    if (lcdBacklightOn) {
+      lcd.noBacklight(); lcdBacklightOn = false;
+      lcdParpadeoNext = ahora + LCD_BLINK_OFF_MS;
+    } else {
+      lcd.backlight();   lcdBacklightOn = true;
+      lcdParpadeoNext = ahora + LCD_BLINK_ON_MS;
+    }
+  }
+}
 
 // ── LCD ──────────────────────────────────────────────────────
 void lcdMostrar(String l1, String l2, String l3, String l4) {
@@ -89,7 +127,7 @@ void lcdMostrarNombre(String nombreCompleto, String codigo) {
       ini = i + 1;
     }
   }
-  // Línea 4: token[3] relleno hasta col 14, código alineado a la derecha en cols 14-19
+  // Linea 4: token[3] hasta col 14, codigo alineado a la derecha en cols 14-19
   String linea4 = tok[3].substring(0, min((int)tok[3].length(), 14));
   while ((int)linea4.length() < 14) linea4 += ' ';
   codigo = codigo.substring(0, min((int)codigo.length(), 6));
@@ -99,94 +137,27 @@ void lcdMostrarNombre(String nombreCompleto, String codigo) {
   lcdMostrar(tok[0], tok[1], tok[2], linea4 + codAli);
 }
 
-// ── RTC ──────────────────────────────────────────────────────
-int bcd2bin(int v) { return (v >> 4) * 10 + (v & 0xF); }
-int bin2bcd(int v) { return ((v / 10) << 4) | (v % 10); }
-
-void rtcEscribir(int registro, int valor) {
-  busRtc.beginTransmission(RTC_DIRECCION);
-  busRtc.write(registro); busRtc.write(valor);
-  busRtc.endTransmission();
-}
-int rtcLeer(int registro) {
-  busRtc.beginTransmission(RTC_DIRECCION);
-  busRtc.write(registro); busRtc.endTransmission(false);
-  busRtc.requestFrom(RTC_DIRECCION, 1);
-  return busRtc.read();
-}
-void rtcHabilitarEscritura() {
-  // El SD3078 requiere una secuencia de TRES pasos para activar EOSC (bit 4 de 0x10):
-  // El chip rechaza la escritura de EOSC si WRTC2/WRTC3 no están activos primero.
-  // Paso 1: activar WRTC1 en 0x10 → habilita escritura en CTR1 (0x0F)
-  // Paso 2: activar WRTC2+WRTC3 en 0x0F → habilita escritura en registros de hora
-  // Paso 3: reescribir 0x10 con EOSC=1 → ahora aceptado porque WRTC1+2+3 están activos
-  // EOSC (bit 4): oscilador activo en modo batería (VCC ausente). Sin él la hora congela.
-  rtcEscribir(0x10, 0x80); delay(5);  // Paso 1: WRTC1=1
-  rtcEscribir(0x0F, 0x84); delay(5);  // Paso 2: WRTC3=1, WRTC2=1, 24H, RTCF=0
-  rtcEscribir(0x10, 0x90); delay(5);  // Paso 3: WRTC1=1 + EOSC=1
-}
+// ── RTC DS3231 (via RTClib) ───────────────────────────────────
 void rtcAjustarHora(int anio, int mes, int dia, int hora, int minuto, int segundo) {
-  rtcHabilitarEscritura();
-  busRtc.beginTransmission(RTC_DIRECCION);
-  busRtc.write(0x00);
-  busRtc.write(bin2bcd(segundo));
-  busRtc.write(bin2bcd(minuto));
-  busRtc.write(bin2bcd(hora) | 0x80);  // bit 7 en alto = modo 24 horas
-  busRtc.write(1);                      // día de semana (no se usa en este sistema)
-  busRtc.write(bin2bcd(dia));
-  busRtc.write(bin2bcd(mes));
-  busRtc.write(bin2bcd(anio - 2000));
-  busRtc.endTransmission();
+  rtcDs3231.adjust(DateTime(anio, mes, dia, hora, minuto, segundo));
 }
-// Reescribe la hora actual en el RTC sin modificarla, restaurando los registros de
-// control y los bits críticos que el SD3078 pierde al cortarse la alimentación:
-//   - Registros 0x0F / 0x10 (write-protection): se resetean al perder VCC.
-//   - Bit 7 del registro de segundos (0x00): en algunos ciclos queda en 1 (halt),
-//     deteniendo el oscilador aunque la batería esté presente.
-//   - Bit 7 del registro de horas (0x02): garantiza modo 24H.
-void rtcReiniciarRegistros() {
-  rtcHabilitarEscritura();
-  busRtc.beginTransmission(RTC_DIRECCION);
-  busRtc.write(0x00); busRtc.endTransmission(false);
-  busRtc.requestFrom(RTC_DIRECCION, 7);
-  int rSeg  = busRtc.read() & 0x7F;   // enmascarar bit 7 → oscilador activo
-  int rMin  = busRtc.read() & 0x7F;
-  int rHora = busRtc.read() & 0x3F;   // extraer horas sin bits de control
-  busRtc.read();                       // día de semana, se descarta
-  int rDia  = busRtc.read() & 0x3F;
-  int rMes  = busRtc.read() & 0x1F;
-  int rAnio = busRtc.read();
-  busRtc.beginTransmission(RTC_DIRECCION);
-  busRtc.write(0x00);
-  busRtc.write(rSeg);           // bit 7 = 0 → oscilador activo
-  busRtc.write(rMin);
-  busRtc.write(rHora | 0x80);  // bit 7 = 1 → modo 24H garantizado
-  busRtc.write(1);              // día de semana (no se usa)
-  busRtc.write(rDia);
-  busRtc.write(rMes);
-  busRtc.write(rAnio);
-  busRtc.endTransmission();
-}
+
 String obtenerTimestamp() {
-  busRtc.beginTransmission(RTC_DIRECCION);
-  busRtc.write(0x00); busRtc.endTransmission(false);
-  busRtc.requestFrom(RTC_DIRECCION, 7);
-  int seg    = bcd2bin(busRtc.read() & 0x7F);
-  int minuto = bcd2bin(busRtc.read() & 0x7F);
-  int hora   = bcd2bin(busRtc.read() & 0x3F);
-  busRtc.read();  // día de semana, se descarta
-  int dia  = bcd2bin(busRtc.read() & 0x3F);
-  int mes  = bcd2bin(busRtc.read() & 0x1F);
-  int anio = 2000 + bcd2bin(busRtc.read());
+  if (!rtcDisponible) return "RTC-ERROR";
+  DateTime now = rtcDs3231.now();
+  int anio = now.year(), mes = now.month(), dia = now.day();
+  int hora = now.hour(), minuto = now.minute(), seg = now.second();
   if (anio < 2020 || anio > 2099 || mes < 1 || mes > 12 ||
       dia < 1 || dia > 31 || hora > 23 || minuto > 59 || seg > 59) {
     Serial.println("RTC ERROR: valores invalidos");
     return "RTC-ERROR";
   }
-  char buffer[20];
-  snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d", anio, mes, dia, hora, minuto, seg);
-  return String(buffer);
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+           anio, mes, dia, hora, minuto, seg);
+  return String(buf);
 }
+
 void parsearCompilacion(int &anio, int &mes, int &dia, int &hora, int &minuto, int &segundo) {
   const char *fecha = __DATE__, *tiempo = __TIME__;
   dia  = atoi(fecha + 4);
@@ -198,36 +169,34 @@ void parsearCompilacion(int &anio, int &mes, int &dia, int &hora, int &minuto, i
   minuto  = atoi(tiempo + 3);
   segundo = atoi(tiempo + 6);
 }
+
 void rtcSincronizarSiNecesario() {
   int anio, mes, dia, hora, minuto, segundo;
   parsearCompilacion(anio, mes, dia, hora, minuto, segundo);
   String buildIdActual = String(__DATE__) + __TIME__;
-  if (almacen.getString("buildID", "") != buildIdActual) {
+  bool firmwareNuevo = (almacen.getString("buildID", "") != buildIdActual);
+  bool perdioAlim    = rtcDs3231.lostPower();
+  if (firmwareNuevo || perdioAlim) {
     rtcAjustarHora(anio, mes, dia, hora, minuto, segundo);
-    almacen.putString("buildID", buildIdActual);
-    Serial.println("RTC: hora actualizada.");
+    if (firmwareNuevo) almacen.putString("buildID", buildIdActual);
+    Serial.println(firmwareNuevo ? "RTC: hora actualizada (nuevo firmware)."
+                                 : "RTC: hora actualizada (perdida de alimentacion).");
   } else {
-    rtcReiniciarRegistros();
     Serial.println("RTC: misma compilacion, hora intacta.");
   }
   Serial.println("RTC: " + obtenerTimestamp());
 }
 
-// ── Helpers RTC para leer fecha/hora sin timestamp completo ───
 struct FechaHora { int anio, mes, dia, hora, minuto, segundo; };
 FechaHora rtcLeerFechaHora() {
-  FechaHora fh = {0,0,0,0,0,0};
-  busRtc.beginTransmission(RTC_DIRECCION); busRtc.write(0x00);
-  busRtc.endTransmission(false); busRtc.requestFrom(RTC_DIRECCION, 7);
-  fh.segundo = bcd2bin(busRtc.read() & 0x7F);
-  fh.minuto  = bcd2bin(busRtc.read() & 0x7F);
-  fh.hora    = bcd2bin(busRtc.read() & 0x3F);
-  busRtc.read();
-  fh.dia  = bcd2bin(busRtc.read() & 0x3F);
-  fh.mes  = bcd2bin(busRtc.read() & 0x1F);
-  fh.anio = 2000 + bcd2bin(busRtc.read());
+  FechaHora fh = {0, 0, 0, 0, 0, 0};
+  if (!rtcDisponible) return fh;
+  DateTime now = rtcDs3231.now();
+  fh.anio    = now.year();   fh.mes     = now.month();  fh.dia    = now.day();
+  fh.hora    = now.hour();   fh.minuto  = now.minute(); fh.segundo = now.second();
   return fh;
 }
+
 int ultimoDiaDelMes(int mes, int anio) {
   const int dias[] = { 0,31,28,31,30,31,30,31,31,30,31,30,31 };
   bool bisiesto = (anio % 4 == 0 && (anio % 100 != 0 || anio % 400 == 0));
@@ -244,7 +213,8 @@ const char ESTILOS[] =
   ".btn-danger{background:#dc3545;color:white;font-weight:bold}"
   ".btn-ok{background:#28a745;color:white;font-weight:bold}"
   ".btn-email{background:#0066cc;color:white;font-weight:bold}"
-  ".entrada{color:#28a745;font-weight:bold}.salida{color:#dc3545;font-weight:bold}</style>";
+  ".entrada{color:#28a745;font-weight:bold}.salida{color:#dc3545;font-weight:bold}"
+  ".pendiente{color:#ff9800;font-weight:bold}</style>";
 
 String pagina(const String& titulo, const String& cuerpo) {
   return "<!doctype html><html><head><meta charset='utf-8'>"
@@ -258,21 +228,15 @@ void logAgregar(const String& ts, const String& uid, const String& nombre, const
   if (f) { f.println(ts + "|" + uid + "|" + nombre + "|" + codigo); f.close(); }
 }
 
-// Parsea "timestamp|uid|nombre|codigo". El 4to campo es opcional para compatibilidad
-// con logs viejos que solo tienen 3 campos.
+// Parsea "timestamp|uid|nombre|codigo". 4to campo opcional (compatibilidad legacy).
 bool logParsear(const String& entrada, String &ts, String &uid, String &nombre, String &codigo) {
   int pos1 = entrada.indexOf('|'), pos2 = entrada.indexOf('|', pos1 + 1);
   if (pos1 < 0 || pos2 < 0) return false;
   ts  = entrada.substring(0, pos1);
   uid = entrada.substring(pos1+1, pos2);
   int pos3 = entrada.indexOf('|', pos2 + 1);
-  if (pos3 < 0) {
-    nombre = entrada.substring(pos2+1);
-    codigo = "";
-  } else {
-    nombre = entrada.substring(pos2+1, pos3);
-    codigo = entrada.substring(pos3+1);
-  }
+  if (pos3 < 0) { nombre = entrada.substring(pos2+1); codigo = ""; }
+  else           { nombre = entrada.substring(pos2+1, pos3); codigo = entrada.substring(pos3+1); }
   return true;
 }
 
@@ -280,13 +244,10 @@ String logHtml() {
   File f = LittleFS.open(ARCHIVO_LOG, "r");
   if (!f || !f.size())
     return "<div class='card'><div class='muted'>No hay eventos registrados.</div></div>";
-
   int total = 0;
   while (f.available()) { if (f.read() == '\n') total++; }
   f.seek(0);
-
-  int mostrar = min(total, 300);
-  int saltar  = total - mostrar;
+  int mostrar = min(total, 300), saltar = total - mostrar;
   String* buf = new String[mostrar];
   int n = 0, fila = 0;
   while (f.available()) {
@@ -296,36 +257,34 @@ String logHtml() {
     buf[n++] = l;
   }
   f.close();
-
-  String resultado = "<div class='card'><div class='muted'>Total: " + String(total) + " eventos";
-  if (total > 300) resultado += " (mostrando los ultimos 300)";
-  resultado += "</div><hr>";
+  String r = "<div class='card'><div class='muted'>Total: " + String(total) + " eventos";
+  if (total > 300) r += " (mostrando los ultimos 300)";
+  r += "</div><hr>";
   for (int i = n - 1; i >= 0; i--) {
     String ts, uid, nombre, codigo;
     if (!logParsear(buf[i], ts, uid, nombre, codigo)) continue;
-    resultado += "<div><b>" + nombre + "</b>";
-    if (codigo.length()) resultado += " <span class='muted'>[" + codigo + "]</span>";
-    resultado += " <span class='muted'>(UID: " + uid + ")</span><br>"
-                 "<span class='ts'>&#128336; " + ts + "</span></div><hr>";
+    r += "<div><b>" + nombre + "</b>";
+    if (codigo.length()) r += " <span class='muted'>[" + codigo + "]</span>";
+    r += " <span class='muted'>(UID: " + uid + ")</span><br>"
+         "<span class='ts'>&#128336; " + ts + "</span></div><hr>";
   }
   delete[] buf;
-  return resultado + "</div>";
+  return r + "</div>";
 }
 
-// Genera CSV con encabezado para descarga y adjunto de email
 String logCsv() {
-  String resultado = "Timestamp,UID,Nombre,Codigo\n";
+  String r = "Timestamp,UID,Nombre,Codigo\n";
   File f = LittleFS.open(ARCHIVO_LOG, "r");
-  if (!f || !f.size()) return resultado;
+  if (!f || !f.size()) return r;
   while (f.available()) {
     String l = f.readStringUntil('\n'); l.trim();
     if (!l.length()) continue;
     String ts, uid, nombre, codigo;
     if (!logParsear(l, ts, uid, nombre, codigo)) continue;
-    resultado += ts + "," + uid + "," + nombre + "," + codigo + "\n";
+    r += ts + "," + uid + "," + nombre + "," + codigo + "\n";
   }
   f.close();
-  return resultado;
+  return r;
 }
 
 // ── Entradas / Salidas (LittleFS) ────────────────────────────
@@ -337,32 +296,25 @@ void entradaAgregar(const String& ts, const String& uid, const String& nombre,
 
 bool entradaParsear(const String& linea, String &ts, String &uid, String &nombre,
                     String &codigo, String &tipo) {
-  int p1 = linea.indexOf('|');
-  int p2 = linea.indexOf('|', p1+1);
-  int p3 = linea.indexOf('|', p2+1);
-  int p4 = linea.indexOf('|', p3+1);
+  int p1 = linea.indexOf('|'), p2 = linea.indexOf('|', p1+1);
+  int p3 = linea.indexOf('|', p2+1), p4 = linea.indexOf('|', p3+1);
   if (p1<0 || p2<0 || p3<0 || p4<0) return false;
   ts     = linea.substring(0, p1);
   uid    = linea.substring(p1+1, p2);
   nombre = linea.substring(p2+1, p3);
   codigo = linea.substring(p3+1, p4);
-  tipo   = linea.substring(p4+1);
-  tipo.trim();
+  tipo   = linea.substring(p4+1); tipo.trim();
   return true;
 }
 
-// Vista HTML agrupada por UID/nombre, con entradas cronológicas dentro de cada grupo
 String entradaHtml() {
   File f = LittleFS.open(ARCHIVO_ENT, "r");
   if (!f || !f.size())
     return "<div class='card'><div class='muted'>No hay registros de entradas/salidas.</div></div>";
-
   int total = 0;
   while (f.available()) { if (f.read() == '\n') total++; }
   f.seek(0);
-
-  int mostrar = min(total, 300);
-  int saltar  = total - mostrar;
+  int mostrar = min(total, 300), saltar = total - mostrar;
   String* buf = new String[mostrar];
   int n = 0, fila = 0;
   while (f.available()) {
@@ -373,7 +325,6 @@ String entradaHtml() {
   }
   f.close();
 
-  // Recopilar UIDs únicos en orden de primera aparición (máx 100 usuarios)
   const int MAX_UIDS = 100;
   String uids[MAX_UIDS]; int nu = 0;
   for (int i = 0; i < n && nu < MAX_UIDS; i++) {
@@ -384,67 +335,137 @@ String entradaHtml() {
     if (!existe) uids[nu++] = uid;
   }
 
-  String resultado = "<div class='card'><div class='muted'>Total: " + String(total) + " registros";
-  if (total > 300) resultado += " (mostrando los ultimos 300)";
-  resultado += "</div><hr>";
+  String r = "<div class='card'><div class='muted'>Total: " + String(total) + " registros";
+  if (total > 300) r += " (mostrando los ultimos 300)";
+  r += "</div><hr>";
 
   for (int u = 0; u < nu; u++) {
-    // Obtener el nombre del primer registro de este UID
     String nombreGrupo = uids[u];
     for (int i = 0; i < n; i++) {
       String ts, uid, nombre, codigo, tipo;
       if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
       if (uid == uids[u]) { nombreGrupo = nombre; break; }
     }
-    resultado += "<div class='card' style='margin:6px 0'>"
-                 "<b>" + nombreGrupo + "</b> <span class='muted'>(UID: " + uids[u] + ")</span>";
+    r += "<div class='card' style='margin:6px 0'>"
+         "<b>" + nombreGrupo + "</b> <span class='muted'>(UID: " + uids[u] + ")</span>";
     for (int i = 0; i < n; i++) {
       String ts, uid, nombre, codigo, tipo;
       if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
       if (uid != uids[u]) continue;
-      String cls = (tipo == "Entrada") ? "entrada" : "salida";
-      resultado += "<div style='padding:3px 0 3px 8px'>"
-                   "<span class='" + cls + "'>&#x25cf; " + tipo + "</span>"
-                   " <span class='ts'>&#128336; " + ts + "</span>";
-      if (codigo.length()) resultado += " <span class='muted'>[" + codigo + "]</span>";
-      resultado += "</div>";
+      if (tipo == "Salida: Pendiente") {
+        r += "<div style='padding:3px 0 3px 8px'>"
+             "<span class='pendiente'>&#x25cf; Salida: Pendiente</span>"
+             " <span class='muted'>(sin registro de salida)</span>";
+      } else {
+        String cls = (tipo == "Entrada") ? "entrada" : "salida";
+        r += "<div style='padding:3px 0 3px 8px'>"
+             "<span class='" + cls + "'>&#x25cf; " + tipo + "</span>"
+             " <span class='ts'>&#128336; " + ts + "</span>";
+      }
+      if (codigo.length()) r += " <span class='muted'>[" + codigo + "]</span>";
+      r += "</div>";
     }
-    resultado += "</div>";
+    r += "</div>";
   }
-
   delete[] buf;
-  return resultado + "</div>";
+  return r + "</div>";
 }
 
-// Genera CSV con encabezado para descarga y adjunto de email
 String entradaCsv() {
-  String resultado = "Timestamp,UID,Nombre,Codigo,Tipo\n";
+  String r = "Timestamp,UID,Nombre,Codigo,Tipo\n";
   File f = LittleFS.open(ARCHIVO_ENT, "r");
-  if (!f || !f.size()) return resultado;
+  if (!f || !f.size()) return r;
   while (f.available()) {
     String l = f.readStringUntil('\n'); l.trim();
     if (!l.length()) continue;
     String ts, uid, nombre, codigo, tipo;
     if (!entradaParsear(l, ts, uid, nombre, codigo, tipo)) continue;
-    resultado += ts + "," + uid + "," + nombre + "," + codigo + "," + tipo + "\n";
+    r += ts + "," + uid + "," + nombre + "," + codigo + "," + tipo + "\n";
   }
   f.close();
-  return resultado;
+  return r;
+}
+
+// ── Usuarios (ARCHIVO_UIDS + NVS) ────────────────────────────
+// Agrega un UID a ARCHIVO_UIDS si no esta ya presente.
+void uidRegistrar(const String& uid) {
+  File f = LittleFS.open(ARCHIVO_UIDS, "r");
+  if (f) {
+    while (f.available()) {
+      String l = f.readStringUntil('\n'); l.trim();
+      if (l == uid) { f.close(); return; }
+    }
+    f.close();
+  }
+  f = LittleFS.open(ARCHIVO_UIDS, "a");
+  if (f) { f.println(uid); f.close(); }
+}
+
+// Elimina un UID de ARCHIVO_UIDS reescribiendo el archivo sin esa linea.
+void uidEliminar(const String& uid) {
+  File fin = LittleFS.open(ARCHIVO_UIDS, "r");
+  if (!fin) return;
+  String contenido = "";
+  while (fin.available()) {
+    String l = fin.readStringUntil('\n'); l.trim();
+    if (l.length() && l != uid) contenido += l + "\n";
+  }
+  fin.close();
+  File fout = LittleFS.open(ARCHIVO_UIDS, "w");
+  if (fout) { fout.print(contenido); fout.close(); }
+}
+
+String usuariosCsv() {
+  String r = "UID,Nombre,Codigo\n";
+  File f = LittleFS.open(ARCHIVO_UIDS, "r");
+  if (!f) return r;
+  while (f.available()) {
+    String uid = f.readStringUntil('\n'); uid.trim();
+    if (!uid.length()) continue;
+    String nombre = almacen.getString(uid.c_str(), "");
+    if (!nombre.length()) continue;
+    String codigo = almacen.getString(("k" + uid).c_str(), "");
+    r += uid + "," + nombre + "," + codigo + "\n";
+  }
+  f.close();
+  return r;
+}
+
+String usuariosHtml() {
+  File f = LittleFS.open(ARCHIVO_UIDS, "r");
+  if (!f || !f.size())
+    return "<div class='card'><div class='muted'>No hay usuarios registrados.</div></div>";
+  String r = "<div class='card'>"
+    "<table style='width:100%;border-collapse:collapse;font-size:15px'>"
+    "<tr style='background:#f5f5f5'>"
+    "<th style='padding:6px;text-align:left'>UID</th>"
+    "<th style='padding:6px;text-align:left'>Nombre</th>"
+    "<th style='padding:6px;text-align:left'>Codigo</th></tr>";
+  int total = 0;
+  while (f.available()) {
+    String uid = f.readStringUntil('\n'); uid.trim();
+    if (!uid.length()) continue;
+    String nombre = almacen.getString(uid.c_str(), "");
+    if (!nombre.length()) continue;
+    String codigo = almacen.getString(("k" + uid).c_str(), "");
+    r += "<tr><td style='padding:5px;font-family:monospace' class='muted'>" + uid +
+         "</td><td style='padding:5px'><b>" + nombre +
+         "</b></td><td style='padding:5px'>" + codigo + "</td></tr>";
+    total++;
+  }
+  f.close();
+  return r + "</table><div class='muted' style='margin-top:8px'>Total: "
+           + String(total) + " usuarios</div></div>";
 }
 
 // ── NTP ──────────────────────────────────────────────────────
-// Aplica la hora obtenida de NTP al RTC y actualiza el estado global.
 void aplicarTiempoNtp(struct tm& info) {
-  int anio = info.tm_year + 1900;
-  int mes  = info.tm_mon  + 1;
-  int dia  = info.tm_mday;
-  int hora = info.tm_hour;
-  int min  = info.tm_min;
-  int seg  = info.tm_sec;
+  int anio = info.tm_year + 1900, mes  = info.tm_mon  + 1;
+  int dia  = info.tm_mday,        hora = info.tm_hour;
+  int min  = info.tm_min,         seg  = info.tm_sec;
   if (anio < 2024 || anio > 2099) {
     ntpEstado = "NTP: anio invalido (" + String(anio) + ")";
-    Serial.println(ntpEstado);
-    return;
+    Serial.println(ntpEstado); return;
   }
   if (rtcDisponible) rtcAjustarHora(anio, mes, dia, hora, min, seg);
   ultimaNtpSync = millis();
@@ -452,27 +473,21 @@ void aplicarTiempoNtp(struct tm& info) {
   Serial.println("NTP OK -> " + ntpEstado);
 }
 
-// Inicia sincronizacion NTP de forma no bloqueante.
-// El resultado se aplica en verificarNtpPendiente() desde loop().
 void iniciarNtp() {
   if (WiFi.status() != WL_CONNECTED) return;
-  long offset = almacen.getInt("ntpOffset", -18000);  // UTC-5 Colombia por defecto
+  long offset = almacen.getInt("ntpOffset", -18000);
   configTime(offset, 0, "pool.ntp.org", "time.nist.gov");
-  ntpPendiente = true;
-  ntpEstado    = "Sincronizando...";
+  ntpPendiente = true; ntpEstado = "Sincronizando...";
   Serial.printf("NTP: configurado offset=%lds, esperando respuesta...\n", offset);
 }
 
-// Llama desde loop(): si el NTP ya respondio, aplica la hora al RTC.
 void verificarNtpPendiente() {
   if (!ntpPendiente) return;
   struct tm info;
-  if (!getLocalTime(&info, 0)) return;  // aun no hay respuesta
-  ntpPendiente = false;
-  aplicarTiempoNtp(info);
+  if (!getLocalTime(&info, 0)) return;
+  ntpPendiente = false; aplicarTiempoNtp(info);
 }
 
-// Sincronizacion bloqueante (max 10 s) para solicitud manual del usuario.
 bool sincronizarNtpManual() {
   if (WiFi.status() != WL_CONNECTED) { ntpEstado = "Sin WiFi"; return false; }
   long offset = almacen.getInt("ntpOffset", -18000);
@@ -482,9 +497,7 @@ bool sincronizarNtpManual() {
   while (millis() - inicio < 10000) {
     if (getLocalTime(&info, 500)) { ntpPendiente = false; aplicarTiempoNtp(info); return true; }
   }
-  ntpEstado = "NTP: timeout (10 s)";
-  Serial.println(ntpEstado);
-  return false;
+  ntpEstado = "NTP: timeout (10 s)"; Serial.println(ntpEstado); return false;
 }
 
 // ── Email ─────────────────────────────────────────────────────
@@ -492,17 +505,15 @@ void smtpCallback(SMTP_Status status) {
   Serial.print("SMTP cb: "); Serial.println(status.info());
 }
 
-// Convierte "YYYY-MM-DD HH:MM:SS" → "YYYY_MM_DD_HH_MM_SS" para nombres de archivo.
+// Convierte "YYYY-MM-DD HH:MM:SS" a "YYYY_MM_DD_HH_MM_SS" para nombres de archivo.
 String tsParaNombre(const String& ts) {
   String r = ts;
-  r.replace('-', '_');
-  r.replace(' ', '_');
-  r.replace(':', '_');
+  r.replace('-', '_'); r.replace(' ', '_'); r.replace(':', '_');
   return r;
 }
 
-// Lee el primer y ultimo timestamp valido de un archivo de LittleFS y construye el
-// nombre del adjunto: prefijo_TS1__TS2.csv.  Si el archivo esta vacio: prefijo_sin_datos.csv.
+// Genera el nombre del adjunto leyendo el primer y ultimo timestamp valido del archivo.
+// Formato: prefijo_TS1__TS2.csv | Si vacio: prefijo_sin_datos.csv
 String nombreAdjunto(const char* rutaArchivo, const char* prefijo) {
   File f = LittleFS.open(rutaArchivo, "r");
   if (!f || !f.size()) { if (f) f.close(); return String(prefijo) + "_sin_datos.csv"; }
@@ -511,7 +522,7 @@ String nombreAdjunto(const char* rutaArchivo, const char* prefijo) {
     String l = f.readStringUntil('\n'); l.trim();
     if (!l.length()) continue;
     int sep = l.indexOf('|');
-    if (sep < 19) continue;  // timestamp minimo 19 chars ("YYYY-MM-DD HH:MM:SS")
+    if (sep < 19) continue;  // timestamp minimo 19 chars "YYYY-MM-DD HH:MM:SS"
     String ts = l.substring(0, sep);
     if (!primero.length()) primero = ts;
     ultimo = ts;
@@ -521,38 +532,36 @@ String nombreAdjunto(const char* rutaArchivo, const char* prefijo) {
   return String(prefijo) + "_" + tsParaNombre(primero) + "__" + tsParaNombre(ultimo) + ".csv";
 }
 
-// Envía ambos CSV como adjuntos al email guardado en NVS.
-// borrarTras=true  → solo en envio automatico: borra archivos y actualiza lastEmail en NVS.
-// borrarTras=false → envio manual: los archivos permanecen intactos y lastEmail no cambia.
-// Puerto 587 con STARTTLS (recomendado para Gmail con App Password).
-// IMPORTANTE: REMITENTE_CLAVE debe ser un App Password de 16 chars (sin espacios),
-// no la contraseña normal de la cuenta Gmail.
+// Envia logs, entradas y lista de usuarios como adjuntos al email configurado.
+// borrarTras=true  → envio automatico: borra archivos y actualiza lastEmail.
+// borrarTras=false → envio manual:    archivos intactos, lastEmail sin cambios.
 bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTras) {
   String destino = almacen.getString("emailDest", "");
   if (!destino.length()) { emailEstado = "Sin destinatario configurado"; return false; }
   if (WiFi.status() != WL_CONNECTED) { emailEstado = "Sin conexion WiFi"; return false; }
 
-  // Generar nombres de adjunto con el rango de timestamps del archivo ANTES de cualquier borrado.
+  // Generar nombres de adjunto ANTES de cualquier posible borrado
   String nomLog = nombreAdjunto(ARCHIVO_LOG, "accesos");
   String nomEnt = nombreAdjunto(ARCHIVO_ENT, "entradas");
 
   String fechaHoy = rtcDisponible ? obtenerTimestamp().substring(0, 10) : "sin-fecha";
-  String asunto   = "Registros NFC - " + fechaHoy;
-  String cuerpo   = "Reporte " + String(borrarTras ? "automatico" : "manual") + " del sistema NFC.\n"
-                    "Fecha: " + fechaHoy + "\n\n"
-                    "Adjuntos:\n"
-                    "  - " + nomLog + "  : log de accesos por tarjeta\n"
-                    "  - " + nomEnt + " : registro de entradas y salidas\n";
+  String fechaUsr = fechaHoy; fechaUsr.replace("-", "_");
+  String nomUsr   = "usuarios_" + fechaUsr + ".csv";
+
+  String asunto = "Registros NFC - " + fechaHoy;
+  String cuerpo = "Reporte " + String(borrarTras ? "automatico" : "manual")
+                  + " del sistema NFC.\nFecha: " + fechaHoy + "\n\nAdjuntos:\n"
+                  "  - " + nomLog + "\n"
+                  "  - " + nomEnt + "\n"
+                  "  - " + nomUsr + "\n";
 
   Session_Config config;
-  config.server.host_name  = SMTP_HOST;
-  config.server.port       = SMTP_PORT;
-  config.login.email       = REMITENTE_EMAIL;
-  config.login.password    = REMITENTE_CLAVE;
-  config.login.user_domain = "";
-  // STARTTLS (port 587) o SSL implicito (port 465)
-  config.secure.startTLS   = (SMTP_PORT == 587);
-  // NTP interno de la libreria como respaldo para validar certificados TLS
+  config.server.host_name      = SMTP_HOST;
+  config.server.port           = SMTP_PORT;
+  config.login.email           = REMITENTE_EMAIL;
+  config.login.password        = REMITENTE_CLAVE;
+  config.login.user_domain     = "";
+  config.secure.startTLS       = (SMTP_PORT == 587);
   config.time.ntp_server       = F("pool.ntp.org,time.nist.gov");
   config.time.gmt_offset       = almacen.getInt("ntpOffset", -18000);
   config.time.day_light_offset = 0;
@@ -565,43 +574,46 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
   message.text.content = cuerpo.c_str();
   message.text.charSet = F("utf-8");
 
-  // descr.name  → parámetro "name"     en Content-Type (referencia interna del mensaje).
-  // descr.filename → parámetro "filename" en Content-Disposition (nombre visible en el adjunto).
-  // Ambos deben asignarse; sin descr.filename la librería deja el adjunto sin nombre ("noname").
+  // descr.name  → parametro "name" en Content-Type.
+  // descr.filename → parametro "filename" en Content-Disposition (nombre visible).
+  // Ambos son necesarios; sin descr.filename la libreria deja el adjunto como "noname".
   SMTP_Attachment attLog;
-  attLog.descr.name              = nomLog.c_str();
-  attLog.descr.filename          = nomLog.c_str();
-  attLog.descr.mime              = F("text/csv");
+  attLog.descr.name = nomLog.c_str(); attLog.descr.filename = nomLog.c_str();
+  attLog.descr.mime = F("text/csv");
   attLog.descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
-  attLog.blob.data               = (uint8_t*)csvLog.c_str();
-  attLog.blob.size               = csvLog.length();
+  attLog.blob.data = (uint8_t*)csvLog.c_str(); attLog.blob.size = csvLog.length();
   message.addAttachment(attLog);
 
   SMTP_Attachment attEnt;
-  attEnt.descr.name              = nomEnt.c_str();
-  attEnt.descr.filename          = nomEnt.c_str();
-  attEnt.descr.mime              = F("text/csv");
+  attEnt.descr.name = nomEnt.c_str(); attEnt.descr.filename = nomEnt.c_str();
+  attEnt.descr.mime = F("text/csv");
   attEnt.descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
-  attEnt.blob.data               = (uint8_t*)csvEntradas.c_str();
-  attEnt.blob.size               = csvEntradas.length();
+  attEnt.blob.data = (uint8_t*)csvEntradas.c_str(); attEnt.blob.size = csvEntradas.length();
   message.addAttachment(attEnt);
 
-  smtp.debug(1);  // log completo por Serial de todo el dialogo SMTP
+  String csvUsr = usuariosCsv();
+  SMTP_Attachment attUsr;
+  attUsr.descr.name = nomUsr.c_str(); attUsr.descr.filename = nomUsr.c_str();
+  attUsr.descr.mime = F("text/csv");
+  attUsr.descr.transfer_encoding = Content_Transfer_Encoding::enc_base64;
+  attUsr.blob.data = (uint8_t*)csvUsr.c_str(); attUsr.blob.size = csvUsr.length();
+  message.addAttachment(attUsr);
+
+  smtp.debug(1);
   smtp.callback(smtpCallback);
 
-  Serial.printf("SMTP: conectando a %s:%d startTLS=%d remitente=%s dest=%s\n",
-    SMTP_HOST, SMTP_PORT, (SMTP_PORT == 587),
-    REMITENTE_EMAIL, destino.c_str());
-  Serial.printf("SMTP: adjuntos -> \"%s\" \"%s\"\n", nomLog.c_str(), nomEnt.c_str());
+  Serial.printf("SMTP: conectando a %s:%d startTLS=%d dest=%s\n",
+    SMTP_HOST, SMTP_PORT, (SMTP_PORT == 587), destino.c_str());
+  Serial.printf("SMTP: adj -> \"%s\" \"%s\" \"%s\"\n",
+    nomLog.c_str(), nomEnt.c_str(), nomUsr.c_str());
   emailEstado = "Conectando a " + String(SMTP_HOST) + ":" + String(SMTP_PORT) + "...";
 
   if (!smtp.connect(&config)) {
     emailEstado = "Error conexion: " + smtp.errorReason();
     Serial.println("SMTP conexion FALLO: " + smtp.errorReason());
-    smtp.closeSession();
-    return false;
+    smtp.closeSession(); return false;
   }
-  Serial.println("SMTP: conexion OK. Autenticando y enviando...");
+  Serial.println("SMTP: conexion OK. Enviando...");
   emailEstado = "Enviando mensaje...";
 
   bool ok = MailClient.sendMail(&smtp, &message, true);
@@ -612,7 +624,7 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
     if (borrarTras) {
       LittleFS.remove(ARCHIVO_LOG);
       LittleFS.remove(ARCHIVO_ENT);
-      // Actualizar lastEmail con la fecha de hoy para evitar reenvio automatico el mismo dia
+      // Actualizar lastEmail para evitar reenvio automatico el mismo dia
       if (rtcDisponible) {
         FechaHora fh = rtcLeerFechaHora();
         char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
@@ -628,9 +640,67 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
   return ok;
 }
 
-// ── Auto-envío de email en días fijos del mes ─────────────────
-// Días: 10, 20 y último del mes, a medianoche (hora 00:xx).
-// Usa lastEmail en NVS (mismo patrón que lastClean) para evitar doble envío.
+// ── Cierre de dia (medianoche) ────────────────────────────────
+// Ejecuta una sola vez por dia a las 00:xx.
+// Para cada UID con contador impar (Entrada sin Salida), agrega "Salida: Pendiente".
+// Luego resetea todos los contadores a 0 para que el nuevo dia empiece desde Entrada.
+void cerrarDia() {
+  if (!rtcDisponible) return;
+  FechaHora fh = rtcLeerFechaHora();
+  if (fh.hora != 0) return;
+
+  char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
+  if (almacen.getString("lastCierre", "") == String(hoy)) return;
+  Serial.printf("CIERRE-DIA: %s\n", hoy);
+
+  // Recolectar UIDs: primero de ARCHIVO_UIDS, luego de ARCHIVO_ENT (sin repetir)
+  const int MAX_U = 60;
+  String uidList[MAX_U], nomList[MAX_U], codList[MAX_U];
+  int nu = 0;
+
+  for (int pass = 0; pass < 2 && nu < MAX_U; pass++) {
+    const char* archivo = (pass == 0) ? ARCHIVO_UIDS : ARCHIVO_ENT;
+    File f = LittleFS.open(archivo, "r");
+    if (!f) continue;
+    while (f.available() && nu < MAX_U) {
+      String l = f.readStringUntil('\n'); l.trim();
+      if (!l.length()) continue;
+      String uid = l;
+      if (pass == 1) {
+        // ARCHIVO_ENT: ts|uid|nombre|codigo|tipo
+        String ts2, uid2, nom2, cod2, tip2;
+        if (!entradaParsear(l, ts2, uid2, nom2, cod2, tip2)) continue;
+        uid = uid2;
+      }
+      bool existe = false;
+      for (int i = 0; i < nu; i++) if (uidList[i] == uid) { existe = true; break; }
+      if (existe) continue;
+      String nombre = almacen.getString(uid.c_str(), "");
+      if (!nombre.length()) continue;
+      uidList[nu] = uid;
+      nomList[nu] = nombre;
+      codList[nu] = almacen.getString(("k" + uid).c_str(), "");
+      nu++;
+    }
+    f.close();
+  }
+
+  for (int i = 0; i < nu; i++) {
+    String claveCont = "c" + uidList[i];
+    int conteo = almacen.getInt(claveCont.c_str(), 0);
+    if (conteo % 2 == 1) {
+      // Contador impar = ultima accion fue Entrada sin Salida
+      entradaAgregar("Pendiente", uidList[i], nomList[i], codList[i], "Salida: Pendiente");
+      Serial.println("CIERRE-DIA: " + uidList[i] + " -> Salida pendiente");
+    }
+    almacen.putInt(claveCont.c_str(), 0);  // reset: proximo dia comienza en Entrada
+  }
+
+  almacen.putString("lastCierre", String(hoy));
+  Serial.printf("CIERRE-DIA: completado, %d UIDs procesados\n", nu);
+}
+
+// ── Auto-envio de email en dias fijos del mes ─────────────────
 void autoEnviarEmail() {
   if (!rtcDisponible || WiFi.status() != WL_CONNECTED) return;
   if (!almacen.getString("emailDest", "").length()) return;
@@ -645,21 +715,13 @@ void autoEnviarEmail() {
   if (almacen.getString("lastEmail", "") == String(hoy)) return;
 
   Serial.println("AUTO-EMAIL: generando CSV...");
-  String csvLog = logCsv();
-  String csvEnt = entradaCsv();
-
-  // borrarTras=true: al enviar automaticamente se borran archivos y se actualiza lastEmail.
-  if (enviarEmail(csvLog, csvEnt, true)) {
+  if (enviarEmail(logCsv(), entradaCsv(), true))
     Serial.println("AUTO-EMAIL enviado: " + String(hoy));
-  } else {
+  else
     Serial.println("AUTO-EMAIL error: no se pudo enviar.");
-  }
 }
 
 // ── Auto-limpieza de logs ─────────────────────────────────────
-// Días: 15 y último del mes, a medianoche. El email (días 10/20/último) corre
-// primero en loop(), así que si el email del último día falla, la limpieza
-// elimina los archivos de todas formas para liberar LittleFS.
 void autoLimpiarLogs() {
   if (!rtcDisponible) return;
   FechaHora fh = rtcLeerFechaHora();
@@ -698,6 +760,7 @@ void handleHome() {
     "'&#128336; '+await(await fetch('/time')).text();},1000);</script>"
     "<p class='muted'>AP: 192.168.4.1 &nbsp;|&nbsp; " + staInfo + "</p><br>"
     "<a href='/register'><button>Registrar usuario</button></a> "
+    "<a href='/usuarios'><button>&#128101; Usuarios</button></a> "
     "<a href='/logs'><button>Ver logs</button></a> "
     "<a href='/entradas'><button>Entradas/Salidas</button></a> "
     "<a href='/config'><button>&#9881; Configuracion</button></a></div>"));
@@ -729,8 +792,6 @@ void handleSaveName() {
     servidor.send(400, "text/plain", "Codigo invalido (1-6 caracteres)"); return;
   }
   esperandoTarjeta = true; modoEliminar = false;
-  // Resetear estado NFC para que cualquier tarjeta sea aceptada inmediatamente,
-  // sin que el cooldown o tarjetaPresente bloqueen la tarjeta que se va a registrar.
   tarjetaPresente = false; ultimoUid = ""; tiempoUltimoUid = 0;
   lcdMostrar("Registrando:", nombrePendiente, "Acerca tarjeta", "");
   servidor.send(200, "text/html", pagina("Acerca la tarjeta",
@@ -746,8 +807,6 @@ void handleSaveName() {
 
 void handleDeleteUser() {
   esperandoTarjeta = false; modoEliminar = true; nombrePendiente = ""; codigoPendiente = "";
-  // Resetear estado NFC igual que en registro: cualquier tarjeta debe ser detectada
-  // inmediatamente sin importar si ya fue leída antes en este ciclo.
   tarjetaPresente = false; ultimoUid = ""; tiempoUltimoUid = 0;
   lcdMostrar("Modo eliminar", "Acerca tarjeta", "", "");
   servidor.send(200, "text/html", pagina("Borrar usuario",
@@ -771,7 +830,9 @@ void handleStatus() {
   }
   if (esperandoTarjeta) { servidor.send(200, "text/plain", "Esperando tarjeta..."); return; }
   String ultimo = almacen.getString("lastReg", "");
-  if (ultimo.startsWith("OK|")) { almacen.putString("lastReg", ""); servidor.send(200, "text/plain", ultimo); return; }
+  if (ultimo.startsWith("OK|")) {
+    almacen.putString("lastReg", ""); servidor.send(200, "text/plain", ultimo); return;
+  }
   servidor.send(200, "text/plain", "Listo.");
 }
 
@@ -779,13 +840,11 @@ void handleDone() {
   String datos  = servidor.hasArg("d") ? servidor.arg("d") : "";
   String cuerpo = "<h2>&#10003; Registrado</h2><div class='card'>";
   if (datos.startsWith("OK|")) {
-    int pos1 = datos.indexOf('|'),
-        pos2 = datos.indexOf('|', pos1+1),
-        pos3 = datos.indexOf('|', pos2+1),
-        pos4 = (pos3 > 0) ? datos.indexOf('|', pos3+1) : -1;
+    int pos1 = datos.indexOf('|'), pos2 = datos.indexOf('|', pos1+1),
+        pos3 = datos.indexOf('|', pos2+1), pos4 = (pos3>0) ? datos.indexOf('|', pos3+1) : -1;
     cuerpo += "<p>UID: <b>" + datos.substring(pos1+1, pos2) + "</b></p>"
-              "<p>Nombre: <b>" + datos.substring(pos2+1, pos3>0 ? pos3 : datos.length()) + "</b></p>";
-    if (pos3 > 0) cuerpo += "<p>Codigo: <b>" + datos.substring(pos3+1, pos4>0 ? pos4 : datos.length()) + "</b></p>";
+              "<p>Nombre: <b>" + datos.substring(pos2+1, pos3>0?pos3:datos.length()) + "</b></p>";
+    if (pos3 > 0) cuerpo += "<p>Codigo: <b>" + datos.substring(pos3+1, pos4>0?pos4:datos.length()) + "</b></p>";
     if (pos4 > 0) cuerpo += "<p class='ts'>&#128336; " + datos.substring(pos4+1) + "</p>";
   } else cuerpo += "<p class='muted'>Sin datos.</p>";
   cuerpo += "<a href='/'><button>Inicio</button></a> <a href='/logs'><button>Ver logs</button></a></div>";
@@ -796,12 +855,11 @@ void handleDeleted() {
   String datos  = servidor.hasArg("d") ? servidor.arg("d") : "";
   String cuerpo = "<h2>Usuario borrado</h2><div class='card'>";
   if (datos.startsWith("DELETED|")) {
-    int pos1 = datos.indexOf('|'),
-        pos2 = datos.indexOf('|', pos1+1),
+    int pos1 = datos.indexOf('|'), pos2 = datos.indexOf('|', pos1+1),
         pos3 = datos.indexOf('|', pos2+1);
     cuerpo += "<p style='color:#dc3545;font-weight:bold'>&#10003; Usuario eliminado</p>"
               "<p>UID: <b>" + datos.substring(pos1+1, pos2) + "</b></p>"
-              "<p>Nombre: <b>" + datos.substring(pos2+1, pos3>0 ? pos3 : datos.length()) + "</b></p>";
+              "<p>Nombre: <b>" + datos.substring(pos2+1, pos3>0?pos3:datos.length()) + "</b></p>";
     if (pos3 > 0) cuerpo += "<p>Codigo: <b>" + datos.substring(pos3+1) + "</b></p>";
   } else if (datos.startsWith("NOT_FOUND|")) {
     cuerpo += "<p style='color:#ff9800;font-weight:bold'>&#9888; Tarjeta no registrada</p>"
@@ -843,23 +901,16 @@ void handleDownloadLogs() {
 }
 
 void handleCancelar() {
-  esperandoTarjeta = false;
-  modoEliminar     = false;
-  nombrePendiente  = "";
-  codigoPendiente  = "";
-  // Resetear estado NFC al cancelar para que la siguiente lectura normal funcione sin
-  // cooldown residual de una operación de registro/eliminación que fue cancelada.
+  esperandoTarjeta = false; modoEliminar = false; nombrePendiente = ""; codigoPendiente = "";
   tarjetaPresente = false; ultimoUid = ""; tiempoUltimoUid = 0;
   lcdMostrar("Cancelado", "", "", "");
   servidor.send(200, "text/html", pagina("Cancelado",
     "<h2>Operacion cancelada</h2><div class='card'>"
-    "<p class='muted'>No se realizó ningun cambio.</p>"
+    "<p class='muted'>No se realizo ningun cambio.</p>"
     "<a href='/'><button>Inicio</button></a> "
-    "<a href='/register'><button>Registrar usuario</button></a>"
-    "</div>"));
+    "<a href='/register'><button>Registrar usuario</button></a></div>"));
 }
 
-// ── Handlers: Entradas/Salidas ────────────────────────────────
 void handleEntradas() {
   servidor.send(200, "text/html", pagina("Entradas/Salidas",
     "<h2>Registros de Entradas/Salidas</h2>" + entradaHtml() +
@@ -888,6 +939,21 @@ void handleClearEntradas() {
     "<a href='/'><button>Inicio</button></a></div>"));
 }
 
+void handleUsuarios() {
+  servidor.send(200, "text/html", pagina("Usuarios",
+    "<h2>&#128101; Usuarios registrados</h2>" + usuariosHtml() +
+    "<div style='margin:20px 0;display:flex;flex-wrap:wrap;gap:8px'>"
+    "<a href='/'><button>Volver</button></a> "
+    "<a href='/downloadUsuarios'><button class='btn-ok'>&#128229; Descargar CSV</button></a></div>"));
+}
+
+void handleDownloadUsuarios() {
+  String fecha = rtcDisponible ? obtenerTimestamp().substring(0, 10) : "usuarios";
+  fecha.replace("-", "_");
+  servidor.sendHeader("Content-Disposition", "attachment; filename=\"usuarios_" + fecha + ".csv\"");
+  servidor.send(200, "text/csv; charset=utf-8", usuariosCsv());
+}
+
 // ── Handler: Configuracion WiFi + NTP + email ────────────────
 void handleConfig() {
   String ssidGuardado  = almacen.getString("ssidWifi",  "");
@@ -897,20 +963,17 @@ void handleConfig() {
     ? "<span style='color:#28a745'>Conectado &mdash; " + WiFi.localIP().toString() + "</span>"
     : "<span style='color:#dc3545'>Desconectado</span>";
 
-  // Offset NTP actual en horas (guardado en segundos)
-  long   offsetSec = almacen.getInt("ntpOffset", -18000);
+  long   offsetSec  = almacen.getInt("ntpOffset", -18000);
   String offsetHStr = String(offsetSec / 3600);
 
-  // Tiempo desde ultimo sync NTP
   String ntpSyncStr = "Nunca";
   if (ultimaNtpSync > 0) {
     unsigned long segs = (millis() - ultimaNtpSync) / 1000;
-    if (segs < 60)       ntpSyncStr = "hace " + String(segs) + " s";
+    if (segs < 60)        ntpSyncStr = "hace " + String(segs) + " s";
     else if (segs < 3600) ntpSyncStr = "hace " + String(segs/60) + " min";
     else                  ntpSyncStr = "hace " + String(segs/3600) + " h";
   }
 
-  // Color estado email
   String emailColor = "#666";
   if (emailEstado.startsWith("Enviado")) emailColor = "#28a745";
   else if (emailEstado.startsWith("Error")) emailColor = "#dc3545";
@@ -918,7 +981,6 @@ void handleConfig() {
   servidor.send(200, "text/html", pagina("Configuracion",
     "<h2>&#9881; Configuracion</h2>"
 
-    // ── WiFi ──
     "<div class='card'><h3>Red WiFi con internet</h3>"
     "<p>Estado: " + estadoWifi + "</p>"
     "<form method='POST' action='/saveConfig'>"
@@ -935,14 +997,12 @@ void handleConfig() {
     "<p class='muted'>Reportes automaticos los dias 10, 20 y ultimo del mes a medianoche.</p>"
     "</div>"
 
-    // ── NTP ──
     "<div class='card'><h3>&#128336; Sincronizacion NTP</h3>"
     "<p>Estado: <b>" + ntpEstado + "</b></p>"
     "<p class='muted'>Ultima sincronizacion: " + ntpSyncStr + "</p>"
     "<a href='/syncNtp'><button class='btn-ok'>&#8635; Sincronizar hora por NTP ahora</button></a>"
     "</div>"
 
-    // ── Email ──
     "<div class='card'><h3>&#128231; Estado del correo</h3>"
     "<p>Ultimo intento: <b style='color:" + emailColor + "'>" + emailEstado + "</b></p>"
     "<p class='muted'>Host SMTP: " + String(SMTP_HOST) + ":" + String(SMTP_PORT)
@@ -965,20 +1025,17 @@ void handleSaveConfig() {
   if (clave.length()) almacen.putString("claveWifi", clave.c_str());
   if (email.length()) almacen.putString("emailDest", email.c_str());
 
-  // Guardar offset de zona horaria NTP
   if (servidor.hasArg("ntpOffsetH")) {
-    long offsetH   = servidor.arg("ntpOffsetH").toInt();
+    long offsetH = servidor.arg("ntpOffsetH").toInt();
     if (offsetH >= -12 && offsetH <= 14) {
       almacen.putInt("ntpOffset", (int)(offsetH * 3600));
       Serial.printf("NTP: zona horaria guardada UTC%+ld\n", offsetH);
     }
   }
 
-  // Reconectar STA con las nuevas credenciales
   if (ssid.length()) {
     String claveUsar = clave.length() ? clave : almacen.getString("claveWifi", "");
-    WiFi.disconnect(false);
-    delay(200);
+    WiFi.disconnect(false); delay(200);
     WiFi.begin(ssid.c_str(), claveUsar.c_str());
     Serial.println("WiFi: reconectando a " + ssid);
   }
@@ -991,54 +1048,42 @@ void handleSaveConfig() {
     "<a href='/'><button>Inicio</button></a></div>"));
 }
 
-// ── Handler: Envío manual de email ───────────────────────────
 void handleSendEmail() {
   String destino = almacen.getString("emailDest", "");
   if (!destino.length()) {
     servidor.send(200, "text/html", pagina("Sin destinatario",
       "<h2>Email no configurado</h2><div class='card'>"
-      "<p>Configure el email destino en "
-      "<a href='/config'>Configuracion</a>.</p>"
+      "<p>Configure el email destino en <a href='/config'>Configuracion</a>.</p>"
       "<a href='/logs'><button>Volver</button></a></div>"));
     return;
   }
   if (WiFi.status() != WL_CONNECTED) {
     servidor.send(200, "text/html", pagina("Sin conexion",
       "<h2>Sin conexion a internet</h2><div class='card'>"
-      "<p>Configure la red WiFi en "
-      "<a href='/config'>Configuracion</a>.</p>"
+      "<p>Configure la red WiFi en <a href='/config'>Configuracion</a>.</p>"
       "<a href='/logs'><button>Volver</button></a></div>"));
     return;
   }
-
-  // Responder inmediatamente y enviar en background sería lo ideal, pero el WebServer
-  // de Arduino no lo soporta bien. Se envía sincrónicamente y el navegador espera.
   servidor.sendHeader("Content-Type", "text/html; charset=utf-8");
-
-  String csvLog = logCsv();
-  String csvEnt = entradaCsv();
-  // borrarTras=false: el envio manual NO borra archivos ni actualiza lastEmail.
-  bool ok = enviarEmail(csvLog, csvEnt, false);
-
+  bool ok = enviarEmail(logCsv(), entradaCsv(), false);
   if (ok) {
     servidor.send(200, "text/html", pagina("Email enviado",
       "<h2>&#10003; Email enviado</h2><div class='card'>"
       "<p>Archivos enviados a <b>" + destino + "</b>.</p>"
-      "<p class='muted'>Los archivos de log y entradas <b>NO han sido borrados</b> "
-      "(envio manual).</p>"
+      "<p class='muted'>Los archivos de log y entradas <b>NO han sido borrados</b>"
+      " (envio manual).</p>"
       "<a href='/logs'><button>Ver logs</button></a> "
       "<a href='/'><button>Inicio</button></a></div>"));
   } else {
     servidor.send(200, "text/html", pagina("Error al enviar",
       "<h2>&#10060; Error al enviar</h2><div class='card'>"
       "<p>No se pudo enviar el correo.</p>"
-      "<p class='muted'>Verifique las credenciales SMTP en el firmware y que el WiFi tenga internet.</p>"
+      "<p class='muted'>Verifique las credenciales SMTP y que el WiFi tenga internet.</p>"
       "<p class='muted'>Los archivos NO fueron borrados.</p>"
       "<a href='/logs'><button>Volver a logs</button></a></div>"));
   }
 }
 
-// ── Handler: Sincronizacion NTP manual ───────────────────────
 void handleSyncNtp() {
   if (WiFi.status() != WL_CONNECTED) {
     servidor.send(200, "text/html", pagina("Sin WiFi",
@@ -1063,35 +1108,25 @@ String uidAHex(byte* uid, byte longitud) {
   for (int i = 0; i < longitud; i++) { if (uid[i] < 16) hex += "0"; hex += String(uid[i], HEX); }
   hex.toUpperCase(); return hex;
 }
+
 bool leerUidUnaVez(String &uidSalida) {
   byte uid[7]; byte longitud = 0;
   if (!lectorNfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &longitud, 50)) {
     if (tarjetaPresente) {
       tarjetaPresente = false;
       Serial.println("Tarjeta retirada");
-      // ultimoUid NO se borra: el cooldown por tiempo sigue protegiendo contra
-      // re-lecturas causadas por pérdida I2C transitoria del PN532 mientras la
-      // tarjeta sigue físicamente cerca del lector.
+      // ultimoUid NO se borra: el cooldown por tiempo sigue activo mientras la tarjeta
+      // sigue fisicamente cerca (proteccion contra I2C flicker del PN532).
     }
     return false;
   }
-
   String hex = uidAHex(uid, longitud);
   unsigned long ahora = millis();
-
-  // Doble condición de anti-repetición:
-  //   1. Mismo UID y tarjeta físicamente presente (tarjetaPresente = true).
-  //   2. O mismo UID y no han pasado COOLDOWN_TARJETA ms desde la última lectura válida.
-  // Cualquiera de las dos condiciones bloquea una segunda lectura del mismo UID.
-  // Esto cubre el caso de fallo I2C transitorio que pone tarjetaPresente=false
-  // brevemente mientras la tarjeta sigue sobre el lector.
   if (hex == ultimoUid && (tarjetaPresente || (ahora - tiempoUltimoUid < COOLDOWN_TARJETA))) {
-    tarjetaPresente = true;  // mantener estado coherente
-    return false;
+    tarjetaPresente = true; return false;
   }
-
   tarjetaPresente = true;
-  ultimoUid       = uidSalida = hex;
+  ultimoUid = uidSalida = hex;
   tiempoUltimoUid = ahora;
   return true;
 }
@@ -1109,43 +1144,30 @@ void setup() {
   LittleFS.begin(true);
 
   busRtc.begin(RTC_SDA, RTC_SCL); delay(50);
-  busRtc.beginTransmission(RTC_DIRECCION);
-  rtcDisponible = (busRtc.endTransmission() == 0);
+  rtcDisponible = rtcDs3231.begin(&busRtc);
   if (rtcDisponible) {
-    rtcEscribir(0x0F, 0x80); delay(5);  // battery switchover antes de cualquier otra config
     rtcSincronizarSiNecesario();
-    int dbg00 = rtcLeer(0x00);
-    Serial.printf("RTC 0x00 (seg)  = 0x%02X  bit7(CH)=%d\n",  dbg00, (dbg00>>7)&1);
-    Serial.printf("RTC 0x0E (CTR0) = 0x%02X\n",               rtcLeer(0x0E));
-    Serial.printf("RTC 0x0F (CTR1) = 0x%02X  WRTC3=%d WRTC2=%d RTCF=%d 24H=%d\n",
-      rtcLeer(0x0F),
-      (rtcLeer(0x0F)>>7)&1, (rtcLeer(0x0F)>>2)&1,
-      (rtcLeer(0x0F)>>1)&1, !((rtcLeer(0x0F))&1));
-    Serial.printf("RTC 0x10 (CTR2) = 0x%02X  WRTC1=%d EOSC=%d\n",
-      rtcLeer(0x10),
-      (rtcLeer(0x10)>>7)&1, (rtcLeer(0x10)>>4)&1);
+    Serial.printf("DS3231 OK. Temperatura: %.1f C\n", rtcDs3231.getTemperature());
   } else {
-    Serial.println("AVISO: RTC no encontrado. Usando millis().");
+    Serial.println("AVISO: DS3231 no encontrado. Usando millis().");
   }
 
   lectorNfc.begin();
-  uint32_t versionFirmware = lectorNfc.getFirmwareVersion();
-  Serial.println(versionFirmware
-    ? "PN532 OK. Fw v" + String((versionFirmware >> 16) & 0xFF)
+  uint32_t vFirmware = lectorNfc.getFirmwareVersion();
+  Serial.println(vFirmware
+    ? "PN532 OK. Fw v" + String((vFirmware >> 16) & 0xFF)
     : "ERROR: PN532 no detectado!");
   lectorNfc.SAMConfig();
 
-  // Modo AP+STA: el ESP32 es Access Point para clientes locales Y cliente WiFi para internet
+  // Modo AP+STA: Access Point para clientes locales + cliente WiFi para internet
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
   WiFi.softAP(SSID_AP, CLAVE_AP, 6);
   Serial.println("AP: " + String(SSID_AP) + " | IP: " + WiFi.softAPIP().toString());
 
-  // Si hay credenciales WiFi guardadas, intentar conectarse automáticamente
   String ssidGuardado = almacen.getString("ssidWifi", "");
   if (ssidGuardado.length()) {
-    String claveGuardada = almacen.getString("claveWifi", "");
-    WiFi.begin(ssidGuardado.c_str(), claveGuardada.c_str());
+    WiFi.begin(ssidGuardado.c_str(), almacen.getString("claveWifi", "").c_str());
     Serial.println("WiFi STA: conectando a " + ssidGuardado + "...");
   }
 
@@ -1164,6 +1186,8 @@ void setup() {
   servidor.on("/entradas",         handleEntradas);
   servidor.on("/downloadEntradas", handleDownloadEntradas);
   servidor.on("/clearEntradas",    handleClearEntradas);
+  servidor.on("/usuarios",         handleUsuarios);
+  servidor.on("/downloadUsuarios", handleDownloadUsuarios);
   servidor.on("/config",           handleConfig);
   servidor.on("/saveConfig",       HTTP_POST, handleSaveConfig);
   servidor.on("/sendEmail",        handleSendEmail);
@@ -1172,20 +1196,26 @@ void setup() {
   Serial.println("Servidor web iniciado!");
 
   lcdMostrar("Sistema NFC", "Listo...", "", "");
+  lcdIdleDesde = millis();  // iniciar proteccion LCD desde el arranque
 }
 
 void loop() {
   servidor.handleClient();
   unsigned long ahora = millis();
 
-  // Volver al mensaje idle cuando expira el timer del LCD
+  // Proteccion LCD: titileo no bloqueante
+  lcdActualizarParpadeo();
+
+  // Revertir LCD al mensaje idle cuando expira el timer de muestra de nombre
   if (tiempoLcdHasta && ahora >= tiempoLcdHasta) {
     tiempoLcdHasta = 0;
     if (lcdPost == LCD_IDLE) lcdMostrar("Esperando", "tarjeta...", "", "");
     else                     lcdMostrar("Listo", "", "", "");
+    lcdIdleDesde    = ahora;  // activar proteccion LCD al entrar en idle
+    lcdParpadeoNext = 0;
   }
 
-  // Detectar cambio de estado WiFi: lanzar NTP al conectarse
+  // Detectar conexion WiFi nueva: iniciar sincronizacion NTP
   bool wifiAhora = (WiFi.status() == WL_CONNECTED);
   if (wifiAhora && !wifiConectadoPrev) {
     Serial.println("WiFi: conexion establecida. Iniciando NTP...");
@@ -1193,26 +1223,24 @@ void loop() {
   }
   wifiConectadoPrev = wifiAhora;
 
-  // Verificar si el NTP ya respondio y aplicar hora al RTC
+  // Aplicar hora NTP al RTC si ya respondio el servidor
   verificarNtpPendiente();
 
-  // Monitorear WiFi STA: reintentar conexión si se pierde
+  // Reintentar conexion WiFi si se pierde
   if (ahora - ultimaReconexionWifi >= INTERVALO_WIFI) {
     ultimaReconexionWifi = ahora;
     if (!wifiAhora) {
       String ssid = almacen.getString("ssidWifi", "");
-      if (ssid.length()) {
-        String clave = almacen.getString("claveWifi", "");
-        WiFi.begin(ssid.c_str(), clave.c_str());
-      }
+      if (ssid.length()) WiFi.begin(ssid.c_str(), almacen.getString("claveWifi", "").c_str());
     }
   }
 
-  // Auto-email primero, luego auto-limpieza (email debe correr antes para no perder datos)
+  // Tareas periodicas de medianoche: cierre del dia, email automatico y limpieza
   if (ahora - ultimoChequeoLimpieza >= INTERVALO_LIMPIEZA) {
     ultimoChequeoLimpieza = ahora;
-    autoEnviarEmail();
-    autoLimpiarLogs();
+    cerrarDia();       // 1: marcar Salidas Pendientes y resetear contadores
+    autoEnviarEmail(); // 2: enviar email (incluye las Salidas Pendientes recien marcadas)
+    autoLimpiarLogs(); // 3: limpiar archivos si corresponde
   }
 
   if (ahora - ultimaLecturaNfc < INTERVALO_NFC) return;
@@ -1224,25 +1252,24 @@ void loop() {
 
   if (modoEliminar) {
     String nombre = almacen.getString(uid.c_str(), "");
+    lcdWakeUp();
     if (!nombre.length()) {
       almacen.putString("lastDel", "NOT_FOUND|" + uid);
       Serial.println("TARJETA NO REGISTRADA: " + uid);
       lcdMostrar("No registrado", "", "", "");
-      tiempoLcdHasta = millis() + 3000;
-      lcdPost = LCD_IDLE;
+      tiempoLcdHasta = millis() + 3000; lcdPost = LCD_IDLE;
     } else {
       String claveCode = "k" + uid;
-      String codigo = almacen.getString(claveCode.c_str(), "");
+      String codigo    = almacen.getString(claveCode.c_str(), "");
       almacen.remove(uid.c_str());
       almacen.remove(claveCode.c_str());
-      // Resetear el conteo de entradas/salidas al borrar el usuario
-      String claveCont = "c" + uid;  // "c" + max 14 hex chars = 15 chars (límite NVS OK)
+      String claveCont = "c" + uid;
       almacen.remove(claveCont.c_str());
+      uidEliminar(uid);  // quitar de ARCHIVO_UIDS
       almacen.putString("lastDel", "DELETED|" + uid + "|" + nombre + "|" + codigo);
       Serial.println("[" + ts + "] BORRADO: " + uid + " -> " + nombre);
       lcdMostrarNombre(nombre, codigo);
-      tiempoLcdHasta = millis() + 3000;
-      lcdPost = LCD_LISTO;
+      tiempoLcdHasta = millis() + 3000; lcdPost = LCD_LISTO;
     }
     resultadoEliminacion = true; modoEliminar = false; return;
   }
@@ -1252,34 +1279,31 @@ void loop() {
     String claveCont = "c" + uid;
     almacen.putString(uid.c_str(), nombrePendiente);
     almacen.putString(claveCode.c_str(), codigoPendiente);
-    // Resetear el contador de Entrada/Salida al registrar (o re-registrar) una tarjeta,
-    // para que la primera pasada tras el registro siempre sea "Entrada".
-    almacen.putInt(claveCont.c_str(), 0);
+    almacen.putInt(claveCont.c_str(), 0);   // reset: primera pasada sera Entrada
+    uidRegistrar(uid);                      // agregar a ARCHIVO_UIDS
     almacen.putString("lastReg", "OK|" + uid + "|" + nombrePendiente + "|" + codigoPendiente + "|" + ts);
     Serial.println("[" + ts + "] REGISTRADO: " + uid + " -> " + nombrePendiente + " (" + codigoPendiente + ")");
+    lcdWakeUp();
     lcdMostrarNombre(nombrePendiente, codigoPendiente);
-    tiempoLcdHasta = millis() + 4000;
-    lcdPost = LCD_LISTO;
+    tiempoLcdHasta = millis() + 4000; lcdPost = LCD_LISTO;
     esperandoTarjeta = false; codigoPendiente = ""; nombrePendiente = ""; return;
   }
 
-  // Lectura normal: registrar acceso y determinar entrada/salida
-  String nombre = almacen.getString(uid.c_str(), "NO_REGISTRADO");
+  // Lectura normal: registrar acceso y determinar Entrada/Salida
+  String nombre    = almacen.getString(uid.c_str(), "NO_REGISTRADO");
   String claveCode = "k" + uid;
-  String codigo = almacen.getString(claveCode.c_str(), "");
-
-  // Determinar tipo ANTES de escribir, y escribir ambos archivos ANTES de
-  // actualizar el contador NVS: si hay corte de luz entre los dos pasos,
-  // los archivos quedan consistentes entre si y el contador se puede recalcular.
+  String codigo    = almacen.getString(claveCode.c_str(), "");
+  // Determinar tipo antes de escribir; escribir archivos antes de actualizar NVS
+  // para que ambos queden consistentes si hay corte de luz entre los dos pasos.
   String claveCont = "c" + uid;
-  int conteo = almacen.getInt(claveCont.c_str(), 0) + 1;
-  String tipo = (conteo % 2 == 1) ? "Entrada" : "Salida";
+  int    conteo    = almacen.getInt(claveCont.c_str(), 0) + 1;
+  String tipo      = (conteo % 2 == 1) ? "Entrada" : "Salida";
   logAgregar(ts, uid, nombre, codigo);
   entradaAgregar(ts, uid, nombre, codigo, tipo);
-  almacen.putInt(claveCont.c_str(), conteo);  // actualizar despues de ambas escrituras
+  almacen.putInt(claveCont.c_str(), conteo);
 
   Serial.println("[" + ts + "] " + tipo + ": " + uid + " -> " + nombre);
+  lcdWakeUp();
   lcdMostrarNombre(nombre, codigo);
-  tiempoLcdHasta = millis() + 4000;
-  lcdPost = LCD_IDLE;
+  tiempoLcdHasta = millis() + 4000; lcdPost = LCD_IDLE;
 }
