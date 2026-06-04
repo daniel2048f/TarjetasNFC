@@ -542,6 +542,33 @@ bool sincronizarNtpManual() {
   ntpEstado = "NTP: timeout (10 s)"; Serial.println(ntpEstado); return false;
 }
 
+// ── Limpieza atomica de registros ────────────────────────────
+// Resetea en NVS todos los contadores "c"+uid a 0 leyendo ARCHIVO_UIDS.
+// Garantiza que la proxima lectura de cualquier tarjeta sea siempre Entrada.
+void resetearContadoresNvs() {
+  File f = LittleFS.open(ARCHIVO_UIDS, "r");
+  if (!f) return;
+  int n = 0;
+  while (f.available()) {
+    String uid = f.readStringUntil('\n'); uid.trim();
+    if (!uid.length()) continue;
+    almacen.putInt(("c" + uid).c_str(), 0);
+    n++;
+  }
+  f.close();
+  Serial.printf("NVS: %d contadores reseteados a 0\n", n);
+}
+
+// Operacion atomica: borra AMBOS archivos de registro y resetea contadores NVS.
+// Debe llamarse en TODOS los escenarios de borrado (manual y automatico) para
+// mantener el sistema en un estado completamente consistente.
+void limpiarRegistros() {
+  LittleFS.remove(ARCHIVO_LOG);
+  LittleFS.remove(ARCHIVO_ENT);
+  resetearContadoresNvs();
+  Serial.println("LIMPIEZA: logs, entradas y contadores NVS reseteados.");
+}
+
 // ── Email ─────────────────────────────────────────────────────
 void smtpCallback(SMTP_Status status) {
   Serial.print("SMTP cb: "); Serial.println(status.info());
@@ -664,15 +691,14 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
     emailUltimoTs = emailEstado.substring(emailEstado.indexOf('-') + 2);
     Serial.println("SMTP: envio EXITOSO");
     if (borrarTras) {
-      LittleFS.remove(ARCHIVO_LOG);
-      LittleFS.remove(ARCHIVO_ENT);
+      limpiarRegistros();  // borra ambos archivos y resetea contadores NVS
       // Actualizar lastEmail para evitar reenvio automatico el mismo dia
       if (rtcDisponible) {
         FechaHora fh = rtcLeerFechaHora();
         char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
         almacen.putString("lastEmail", String(hoy));
       }
-      Serial.println("EMAIL-AUTO: archivos borrados y lastEmail actualizado.");
+      Serial.println("EMAIL-AUTO: registros borrados, contadores reseteados, lastEmail actualizado.");
     }
   } else {
     emailEstado = "Error envio: " + smtp.errorReason();
@@ -777,7 +803,7 @@ void autoLimpiarLogs() {
   char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
   if (almacen.getString("lastClean", "") == String(hoy)) return;
 
-  LittleFS.remove(ARCHIVO_LOG);
+  limpiarRegistros();
   almacen.putString("lastClean", String(hoy));
   Serial.println("AUTO-LIMPIEZA: " + String(hoy));
 }
@@ -921,18 +947,28 @@ void handleLogs() {
     "<a href='/downloadLogs'><button class='btn-ok'>&#128229; Descargar CSV</button></a> "
     "<a href='/sendEmail' onclick='return confirm(\"Enviar email con todos los registros ahora?\");'>"
     "<button class='btn-email'>&#128231; Enviar por email</button></a> "
-    "<a href='/clearLogs' onclick='return confirm(\"Borrar todos los logs?\");'>"
-    "<button class='btn-danger'>&#128465; Borrar logs</button></a></div>"));
+    "<a href='/clearRegistros' onclick='return confirm(\"Borrar TODOS los registros?\\n"
+    "Se eliminaran logs de acceso, entradas/salidas y se resetearan los contadores de tarjetas.\\n"
+    "Las tarjetas registradas NO se eliminaran.\");'>"
+    "<button class='btn-danger'>&#128465; Borrar todos los registros</button></a></div>"));
 }
 
-void handleClearLogs() {
-  int total = 0;
+void handleClearRegistros() {
+  // Contar registros antes de borrar para el mensaje de confirmacion
+  int totalLog = 0, totalEnt = 0;
   File f = LittleFS.open(ARCHIVO_LOG, "r");
-  if (f) { while (f.available()) { if (f.read() == '\n') total++; } f.close(); }
-  LittleFS.remove(ARCHIVO_LOG);
-  servidor.send(200, "text/html", pagina("Logs borrados",
-    "<h2>Logs borrados</h2><div class='card'>"
-    "<p>&#10003; Eliminados <b>" + String(total) + "</b> eventos.</p>"
+  if (f) { while (f.available()) { if (f.read() == '\n') totalLog++; } f.close(); }
+  f = LittleFS.open(ARCHIVO_ENT, "r");
+  if (f) { while (f.available()) { if (f.read() == '\n') totalEnt++; } f.close(); }
+
+  limpiarRegistros();  // borra ambos archivos y resetea contadores NVS
+
+  servidor.send(200, "text/html", pagina("Registros borrados",
+    "<h2>&#10003; Todos los registros borrados</h2><div class='card'>"
+    "<p>Eliminados <b>" + String(totalLog) + "</b> eventos de acceso (logs).</p>"
+    "<p>Eliminados <b>" + String(totalEnt) + "</b> registros de entradas/salidas.</p>"
+    "<p>Contadores de todas las tarjetas reseteados a 0.</p>"
+    "<p class='muted'>La proxima lectura de cualquier tarjeta se registrara como <b>Entrada</b>.</p>"
     "<p class='muted'>Las asociaciones UID&rarr;Nombre NO fueron eliminadas.</p>"
     "<a href='/logs'><button>Ver logs</button></a> "
     "<a href='/'><button>Inicio</button></a></div>"));
@@ -961,8 +997,10 @@ void handleEntradas() {
     "<div style='margin:20px 0;display:flex;flex-wrap:wrap;gap:8px'>"
     "<a href='/'><button>Volver</button></a> "
     "<a href='/downloadEntradas'><button class='btn-ok'>&#128229; Descargar CSV</button></a> "
-    "<a href='/clearEntradas' onclick='return confirm(\"Borrar todos los registros de entradas?\");'>"
-    "<button class='btn-danger'>&#128465; Borrar registros</button></a></div>"));
+    "<a href='/clearRegistros' onclick='return confirm(\"Borrar TODOS los registros?\\n"
+    "Se eliminaran logs de acceso, entradas/salidas y se resetearan los contadores de tarjetas.\\n"
+    "Las tarjetas registradas NO se eliminaran.\");'>"
+    "<button class='btn-danger'>&#128465; Borrar todos los registros</button></a></div>"));
 }
 
 void handleDownloadEntradas() {
@@ -971,17 +1009,6 @@ void handleDownloadEntradas() {
   servidor.send(200, "text/csv; charset=utf-8", entradaCsv());
 }
 
-void handleClearEntradas() {
-  int total = 0;
-  File f = LittleFS.open(ARCHIVO_ENT, "r");
-  if (f) { while (f.available()) { if (f.read() == '\n') total++; } f.close(); }
-  LittleFS.remove(ARCHIVO_ENT);
-  servidor.send(200, "text/html", pagina("Registros borrados",
-    "<h2>Registros borrados</h2><div class='card'>"
-    "<p>&#10003; Eliminados <b>" + String(total) + "</b> registros.</p>"
-    "<a href='/entradas'><button>Ver entradas</button></a> "
-    "<a href='/'><button>Inicio</button></a></div>"));
-}
 
 void handleUsuarios() {
   servidor.send(200, "text/html", pagina("Usuarios",
@@ -1309,11 +1336,10 @@ void setup() {
   servidor.on("/done",             handleDone);
   servidor.on("/logs",             handleLogs);
   servidor.on("/downloadLogs",     handleDownloadLogs);
-  servidor.on("/clearLogs",        handleClearLogs);
   servidor.on("/cancelar",         handleCancelar);
   servidor.on("/entradas",         handleEntradas);
   servidor.on("/downloadEntradas", handleDownloadEntradas);
-  servidor.on("/clearEntradas",    handleClearEntradas);
+  servidor.on("/clearRegistros",   handleClearRegistros);
   servidor.on("/usuarios",         handleUsuarios);
   servidor.on("/downloadUsuarios", handleDownloadUsuarios);
   servidor.on("/config",           handleConfig);
