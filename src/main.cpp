@@ -76,9 +76,9 @@ LcdPost lcdPost = LCD_IDLE;
 bool          lcdBacklightOn  = true;
 unsigned long lcdIdleDesde    = 0;     // millis() al entrar en idle; 0 = no idle
 unsigned long lcdParpadeoNext = 0;     // proxima inversion del backlight
-const unsigned long LCD_IDLE_BLINK_INICIO = 120000UL; // 2 min idle antes de titular
-const unsigned long LCD_BLINK_ON_MS       = 3000UL;   // s con luz encendida
-const unsigned long LCD_BLINK_OFF_MS      = 1000UL;   // s con luz apagada
+const unsigned long LCD_IDLE_BLINK_INICIO = 5000UL; // 5 seg idle antes de titular
+const unsigned long LCD_BLINK_ON_MS       = 300UL;   // s con luz encendida
+const unsigned long LCD_BLINK_OFF_MS      = 50UL;   // s con luz apagada
 
 // ── PN532 watchdog ────────────────────────────────────────────
 // El PN532 puede quedar en estado inconsistente si recibe una secuencia I2C
@@ -708,13 +708,54 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
   return ok;
 }
 
+// ── Cierre de dia al arrancar ────────────────────────────────
+// Cubre cortes de alimentacion: al arrancar, recorre ARCHIVO_UIDS y para
+// cada UID registrado con fecha de ultimo acceso estrictamente anterior a
+// hoy y contador impar, genera "Salida: Pendiente" y resetea el contador.
+// Usa "f"+uid (no solo el contador) para descartar UIDs cuyo contador
+// impar pertenece al dia actual, evitando falsos positivos.
+// Debe llamarse en setup() despues de que el RTC esta inicializado y
+// ARCHIVO_UIDS esta reconstruido, antes de entrar al loop().
+void cerrarDiaArranque() {
+  if (!rtcDisponible) return;
+  FechaHora fh = rtcLeerFechaHora();
+  char buf[11]; snprintf(buf, sizeof(buf), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
+  String fechaHoy = String(buf);
+
+  File f = LittleFS.open(ARCHIVO_UIDS, "r");
+  if (!f) { Serial.println("ARRANQUE: ARCHIVO_UIDS no disponible, cierre de dia omitido"); return; }
+
+  int pendientes = 0;
+  while (f.available()) {
+    String uid = f.readStringUntil('\n'); uid.trim();
+    if (!uid.length()) continue;
+    String nombre = almacen.getString(uid.c_str(), "");
+    if (!nombre.length()) continue;  // tarjeta no registrada en NVS
+    String fechaUltima = almacen.getString(("f" + uid).c_str(), "");
+    // Comparacion lexicografica de "YYYY-MM-DD" equivale a numerica.
+    // Omitir si no hay historial o si el ultimo acceso es del dia actual o futuro.
+    if (!fechaUltima.length() || fechaUltima >= fechaHoy) continue;
+    String claveCont = "c" + uid;
+    int conteo = almacen.getInt(claveCont.c_str(), 0);
+    if (conteo % 2 == 1) {
+      String codigo = almacen.getString(("k" + uid).c_str(), "");
+      entradaAgregar("Pendiente", uid, nombre, codigo, "Salida: Pendiente");
+      Serial.println("ARRANQUE: " + uid + " -> Salida pendiente (corte de alimentacion)");
+      pendientes++;
+    }
+    almacen.putInt(claveCont.c_str(), 0);  // reset: dia nuevo empieza desde Entrada
+  }
+  f.close();
+  Serial.printf("ARRANQUE: cierre de dia completado — %d salidas pendientes registradas\n", pendientes);
+}
+
 // ── Cierre de dia ────────────────────────────────────────────
-// Se ejecuta una sola vez por dia (clave NVS lastCierre) en cuanto se detecta
-// un dia nuevo, sin importar la hora. Esto cubre el caso en que el sistema estuvo
-// apagado a medianoche: si arranca a las 09:00 del dia siguiente, cerrarDia corre
-// igual y resetea los contadores antes de la primera lectura real del dia.
-// Para cada UID con contador impar (Entrada sin Salida), agrega "Salida: Pendiente".
-// Luego resetea todos los contadores a 0 para que el nuevo dia empiece desde Entrada.
+// Se ejecuta una sola vez por dia (clave NVS lastCierre) verificando si
+// el dia cambio. Para cada UID con contador impar (Entrada sin Salida),
+// agrega "Salida: Pendiente". Luego resetea todos los contadores a 0.
+// Nota: los cortes de alimentacion son cubiertos por cerrarDiaArranque()
+// en setup(); esta funcion cubre el caso normal en que el ESP32 sigue
+// encendido al cambiar el dia o arranca pocos minutos despues de medianoche.
 void cerrarDia() {
   if (!rtcDisponible) return;
   FechaHora fh = rtcLeerFechaHora();
@@ -1298,6 +1339,7 @@ void setup() {
   rtcDisponible = rtcDs3231.begin(&busRtc);
   if (rtcDisponible) {
     rtcSincronizarSiNecesario();
+    cerrarDiaArranque();  // barrido de Salidas Pendientes antes de la primera lectura
     Serial.printf("DS3231 OK. Temperatura: %.1f C\n", rtcDs3231.getTemperature());
   } else {
     Serial.println("AVISO: DS3231 no encontrado. Usando millis().");
