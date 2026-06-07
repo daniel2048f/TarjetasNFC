@@ -1471,7 +1471,11 @@ void loop() {
                        ? ts.substring(0, 10) : "";
   if (fechaHoy.length() && fechaUltima.length() && fechaUltima != fechaHoy) {
     int conteoAnterior = almacen.getInt(claveCont.c_str(), 0);
-    if (conteoAnterior % 2 == 1) {
+    // Solo marcar Salida Pendiente si la tarjeta esta registrada en NVS.
+    // cerrarDia() aplica la misma guarda; sin ella, tarjetas NO_REGISTRADO
+    // acumulan un contador impar que nunca se resetea y generan un fantasma.
+    bool estaRegistrado = almacen.getString(uid.c_str(), "").length() > 0;
+    if (conteoAnterior % 2 == 1 && estaRegistrado) {
       entradaAgregar("Pendiente", uid, nombre, codigo, "Salida: Pendiente");
       Serial.println("NUEVO-DIA: " + uid + " -> Salida pendiente (cerrarDia tardio)");
     }
