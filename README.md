@@ -196,9 +196,10 @@ Todas las rutas son accesibles desde `http://192.168.4.1`.
 | `/downloadUsuarios` | GET    | Descarga la lista de usuarios en formato CSV                               |
 | `/config`           | GET    | Página de configuración (WiFi, email, zona horaria)                        |
 | `/saveConfig`       | POST   | Guarda la configuración y reconecta el WiFi                                |
-| `/sendEmail`        | GET    | Envía manualmente un correo con todos los registros adjuntos               |
-| `/syncNtp`          | GET    | Sincroniza el reloj con servidores NTP manualmente                         |
-| `/time`             | GET    | Devuelve la hora actual como texto (usado por el reloj en vivo de la web)  |
+| `/sendEmail`             | GET    | Envía manualmente un correo con todos los registros adjuntos               |
+| `/syncNtp`               | GET    | Sincroniza el reloj con servidores NTP manualmente                         |
+| `/time`                  | GET    | Devuelve la hora actual como texto (usado por el reloj en vivo de la web)  |
+| `/confirmarEmailPend`    | GET    | Limpia la bandera de reporte pendiente (accionado desde el banner de alerta)|
 
 ### Proceso de registro de usuario
 
@@ -283,11 +284,20 @@ Esta información permite detectar correctamente si hubo una Entrada sin Salida 
 
 ### Cuándo se envía
 
-El sistema envía automáticamente un correo en los **días 10, 20 y el último día del mes**, a medianoche (hora 0). El correo solo se envía si:
+El sistema envía automáticamente un correo en los **días 10, 20 y el último día del mes**. Hay dos ventanas de envío por día:
 
-- El WiFi con internet está conectado.
+| Ventana | Hora       | Comportamiento                                                      |
+| ------- | ---------- | ------------------------------------------------------------------- |
+| 1.ª     | Medianoche | Primer intento automático                                           |
+| 2.ª     | Mediodía   | Reintento si la primera ventana falló (sin internet, sin corriente) |
+
+El correo solo se envía si:
+
+- El WiFi con internet está conectado en el momento del intento.
 - Hay un email de destino configurado.
 - No se ha enviado ya el correo ese mismo día (clave NVS `lastEmail`).
+
+**Si el ESP32 estaba apagado en la ventana de medianoche**, al arrancar entre las 0:01 y las 11:59 el sistema espera la ventana del mediodía para reintentar. Si arranca después de las 12:59 sin haber enviado, activa la alerta de reporte pendiente (ver sección siguiente).
 
 ### Contenido del correo
 
@@ -303,9 +313,20 @@ Tras un envío automático exitoso, el sistema **borra ambos archivos de registr
 
 El envío **manual** (botón "Enviar por email" en la web) genera el mismo correo pero **no borra los archivos**.
 
-### Limpieza automática de registros
+### Alerta de reporte pendiente
 
-Adicionalmente, los días **15 y el último día del mes** a medianoche, el sistema borra ambos archivos de registro y resetea contadores aunque no haya envío de correo configurado. Esta limpieza es independiente del correo.
+Si ambas ventanas del día de envío pasan sin que el correo se haya podido enviar (sin internet en todo el día, o el ESP32 estuvo apagado en ambas ventanas), el sistema activa una **bandera de reporte pendiente** que se guarda en NVS y persiste entre reinicios.
+
+Mientras la bandera esté activa, **todas las páginas de la interfaz web** muestran un banner de advertencia:
+
+> ⚠ **Correo con logs no enviado y archivos no eliminados de memoria. Por favor descárgalos y borra la memoria manualmente.**
+
+El banner incluye un botón **✓ Confirmar**. Al hacer clic:
+1. El navegador pide confirmación: *"¿Ya descargaste los logs y borraste la memoria?"*
+2. Si el usuario confirma, la bandera se limpia y el mensaje desaparece.
+3. Si cancela, el mensaje sigue apareciendo.
+
+La responsabilidad de descargar los logs manualmente y borrar la memoria antes de confirmar es del usuario. Un envío automático exitoso posterior también limpia la bandera.
 
 ---
 
@@ -363,6 +384,24 @@ Adicionalmente, los días **15 y el último día del mes** a medianoche, el sist
 - **Dirección I2C incorrecta:** La dirección predeterminada del módulo PCF8574 es `0x27`. Algunos módulos usan `0x3F`. Verificar con un escáner I2C o revisar las soldaduras A0/A1/A2 del módulo.
 - **Contraste desajustado:** El módulo LCD tiene un potenciómetro de contraste (tornillo pequeño en la parte trasera). Ajustarlo hasta que los caracteres sean visibles.
 - **Bus I2C compartido con PN532 interrumpido:** El sistema incluye recuperación automática del bus. Si el problema es intermitente, el watchdog del PN532 debería resolverlo. Si es persistente, verificar las conexiones físicas.
+
+### Aparece el banner "Correo con logs no enviado"
+
+**Síntoma:** Todas las páginas de la web muestran un banner amarillo de advertencia sobre un reporte no enviado.
+
+**Causas y soluciones:**
+
+- **Ambas ventanas de envío fallaron:** El día de envío (10, 20 o último del mes), el sistema intentó enviar correo a medianoche y al mediodía, pero ambas fallaron (sin WiFi, sin corriente o error SMTP). Los archivos de registro no fueron borrados.
+- **El sistema estuvo apagado todo el día de envío:** Si el ESP32 no estaba encendido en ninguna de las dos ventanas y arrancó después de las 12:59 de ese día, activa la alerta directamente.
+
+**Qué hacer:**
+
+1. Ir a `/logs` y descargar el CSV de accesos.
+2. Ir a `/entradas` y descargar el CSV de entradas/salidas.
+3. Opcionalmente, usar el botón "Enviar por email" si el WiFi tiene internet ahora (esto enviará el correo y borrará los archivos automáticamente).
+4. Si se borraron los archivos manualmente (`/clearRegistros`), hacer clic en **✓ Confirmar** del banner y confirmar que ya se descargaron los datos.
+
+El banner desaparece al confirmar. No desaparece solo si solo se descargaron o solo se borraron los archivos — requiere confirmación explícita.
 
 ### El sistema no detecta el cambio de día (Salidas Pendientes no aparecen)
 

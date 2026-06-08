@@ -71,8 +71,9 @@ unsigned long ultimaNtpSync     = 0;
 bool          wifiConectadoPrev = false;
 
 // ── Estado email ─────────────────────────────────────────────
-String emailEstado   = "Sin intentos";
-String emailUltimoTs = "";
+String emailEstado        = "Sin intentos";
+String emailUltimoTs      = "";
+bool   emailPendienteFlag = false;  // true si ambas ventanas de auto-envio fallaron sin enviar
 
 // ── Timer LCD no bloqueante ───────────────────────────────────
 unsigned long tiempoLcdHasta = 0;
@@ -315,6 +316,21 @@ int ultimoDiaDelMes(int mes, int anio) {
 }
 
 // ── HTML ─────────────────────────────────────────────────────
+// Banner de alerta cuando el auto-envio de correo fallo en ambas ventanas del dia.
+// Se inserta al inicio del body en todas las paginas mientras la bandera este activa.
+String bannerAlerta() {
+  if (!emailPendienteFlag) return "";
+  return "<div style='background:#fff3cd;border:2px solid #e6a817;border-radius:8px;"
+         "padding:14px 16px;margin:0 0 16px 0'>"
+         "<b>&#9888; Correo con logs no enviado y archivos no eliminados de memoria. "
+         "Por favor desc&aacute;rgalos y borra la memoria manualmente.</b> "
+         "<a href='/confirmarEmailPend' "
+         "onclick='return confirm(\"Ya descargaste los logs y borraste la memoria?\")'>"
+         "<button style='background:#28a745;color:white;font-weight:bold;padding:8px 14px;"
+         "border:none;border-radius:6px;cursor:pointer'>&#10003; Confirmar</button>"
+         "</a></div>";
+}
+
 const char ESTILOS[] =
   "<style>body{font-family:Arial;margin:24px;max-width:720px}"
   "a,button,input{font-size:18px}button{padding:10px 14px;cursor:pointer}"
@@ -330,7 +346,8 @@ const char ESTILOS[] =
 String pagina(const String& titulo, const String& cuerpo) {
   return "<!doctype html><html><head><meta charset='utf-8'>"
          "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-         "<title>" + titulo + "</title>" + ESTILOS + "</head><body>" + cuerpo + "</body></html>";
+         "<title>" + titulo + "</title>" + ESTILOS + "</head><body>"
+         + bannerAlerta() + cuerpo + "</body></html>";
 }
 
 // ── Logs de acceso (LittleFS) ─────────────────────────────────
@@ -800,6 +817,11 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
         char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
         almacen.putString("lastEmail", String(hoy));
       }
+      // Limpiar bandera de pendiente: el envio exitoso resuelve la situacion
+      if (emailPendienteFlag) {
+        emailPendienteFlag = false;
+        almacen.putBool("emailPend", false);
+      }
       Serial.println("EMAIL-AUTO: registros borrados, contadores reseteados, lastEmail actualizado.");
     }
     ledParpadear(LED_VERDE, LED_BLINK_N);
@@ -916,41 +938,36 @@ void cerrarDia() {
 }
 
 // ── Auto-envio de email en dias fijos del mes ─────────────────
+// Ventana 1: hora 0 (medianoche). Ventana 2: hora 12 (mediodia, reintento si fallo la 1).
+// Si ambas ventanas pasan sin envio exitoso, activa emailPendienteFlag para alertar al usuario.
 void autoEnviarEmail() {
-  if (!rtcDisponible || WiFi.status() != WL_CONNECTED) return;
+  if (!rtcDisponible) return;
   if (!almacen.getString("emailDest", "").length()) return;
 
   FechaHora fh = rtcLeerFechaHora();
-  if (fh.hora != 0) return;
-
   int ud = ultimoDiaDelMes(fh.mes, fh.anio);
   if (fh.dia != 10 && fh.dia != 20 && fh.dia != ud) return;
 
   char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
-  if (almacen.getString("lastEmail", "") == String(hoy)) return;
+  if (almacen.getString("lastEmail", "") == String(hoy)) return;  // ya enviado hoy
 
-  Serial.println("AUTO-EMAIL: generando CSV...");
-  if (enviarEmail(logCsv(), entradaCsv(), true))
-    Serial.println("AUTO-EMAIL enviado: " + String(hoy));
-  else
-    Serial.println("AUTO-EMAIL error: no se pudo enviar.");
-}
-
-// ── Auto-limpieza de logs ─────────────────────────────────────
-void autoLimpiarLogs() {
-  if (!rtcDisponible) return;
-  FechaHora fh = rtcLeerFechaHora();
-  if (fh.hora != 0) return;
-
-  int ud = ultimoDiaDelMes(fh.mes, fh.anio);
-  if (fh.dia != 15 && fh.dia != ud) return;
-
-  char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
-  if (almacen.getString("lastClean", "") == String(hoy)) return;
-
-  limpiarRegistros();
-  almacen.putString("lastClean", String(hoy));
-  Serial.println("AUTO-LIMPIEZA: " + String(hoy));
+  if (fh.hora == 0 || fh.hora == 12) {
+    // Intentar solo si hay internet disponible; si no, reintentar en el proximo ciclo de 60 s
+    if (WiFi.status() != WL_CONNECTED) return;
+    Serial.printf("AUTO-EMAIL: ventana hora %d, generando CSV...\n", fh.hora);
+    bool ok = enviarEmail(logCsv(), entradaCsv(), true);
+    Serial.println(ok ? "AUTO-EMAIL enviado: " + String(hoy)
+                      : "AUTO-EMAIL: fallo en ventana hora " + String(fh.hora));
+    // Si fallo pero es hora 12 (segunda ventana), la bandera se activara al pasar a hora > 12
+  } else if (fh.hora > 12) {
+    // Ambas ventanas del dia ya pasaron sin envio exitoso
+    if (!emailPendienteFlag) {
+      emailPendienteFlag = true;
+      almacen.putBool("emailPend", true);
+      Serial.println("AUTO-EMAIL: ambas ventanas agotadas, bandera pendiente activada.");
+    }
+  }
+  // hora 1-11: esperar la ventana del mediodia; no hacer nada
 }
 
 // ── Handlers web ─────────────────────────────────────────────
@@ -1217,7 +1234,8 @@ void handleConfig() {
     "<input type='number' name='ntpOffsetH' min='-12' max='14' value='" + offsetHStr + "'><br><br>"
     "<button type='submit'>&#10003; Guardar y reconectar</button></form>"
     "<p class='muted'>Ultimo envio automatico de correo: " + ultimoEmail + "</p>"
-    "<p class='muted'>Reportes automaticos los dias 10, 20 y ultimo del mes a medianoche.</p>"
+    "<p class='muted'>Reportes automaticos los dias 10, 20 y ultimo del mes a medianoche "
+    "(reintento al mediodia si falla). Si ambos fallan, aparece alerta en la web.</p>"
     "</div>"
 
     "<div class='card'><h3>&#128336; Sincronizacion NTP</h3>"
@@ -1305,6 +1323,13 @@ void handleSendEmail() {
       "<p class='muted'>Los archivos NO fueron borrados.</p>"
       "<a href='/logs'><button>Volver a logs</button></a></div>"));
   }
+}
+
+void handleConfirmarEmailPend() {
+  emailPendienteFlag = false;
+  almacen.putBool("emailPend", false);
+  servidor.sendHeader("Location", "/");
+  servidor.send(302, "text/plain", "");
 }
 
 void handleSyncNtp() {
@@ -1447,6 +1472,7 @@ void setup() {
 
   // NVS y LittleFS deben inicializarse antes que el RTC (buildID usa NVS)
   almacen.begin("nfc", false);
+  emailPendienteFlag = almacen.getBool("emailPend", false);  // restaurar bandera tras reinicio
   LittleFS.begin(true);
   reconstruirArchivoUids();  // sincronizar ARCHIVO_UIDS con NVS en cada arranque
 
@@ -1501,8 +1527,9 @@ void setup() {
   servidor.on("/downloadUsuarios", handleDownloadUsuarios);
   servidor.on("/config",           handleConfig);
   servidor.on("/saveConfig",       HTTP_POST, handleSaveConfig);
-  servidor.on("/sendEmail",        handleSendEmail);
-  servidor.on("/syncNtp",          handleSyncNtp);
+  servidor.on("/sendEmail",           handleSendEmail);
+  servidor.on("/syncNtp",             handleSyncNtp);
+  servidor.on("/confirmarEmailPend",  handleConfirmarEmailPend);
   servidor.begin();
   Serial.println("Servidor web iniciado!");
 
@@ -1548,12 +1575,11 @@ void loop() {
     }
   }
 
-  // Tareas periodicas de medianoche: cierre del dia, email automatico y limpieza
+  // Tareas periodicas: cierre del dia y envio automatico de email
   if (ahora - ultimoChequeoLimpieza >= INTERVALO_LIMPIEZA) {
     ultimoChequeoLimpieza = ahora;
     cerrarDia();       // 1: marcar Salidas Pendientes y resetear contadores
     autoEnviarEmail(); // 2: enviar email (incluye las Salidas Pendientes recien marcadas)
-    autoLimpiarLogs(); // 3: limpiar archivos si corresponde
   }
 
   // Watchdog PN532: verificar salud del chip cada NFC_CHECK_INTERVALO ms.

@@ -36,8 +36,8 @@ Todo el código reside en un único archivo `src/main.cpp` (~1600 líneas). No h
 │  f<uid>     → fecha último acceso "YYYY-MM-DD"       │
 │  buildID    → __DATE__ + __TIME__ (detección firmware)│
 │  lastCierre → "YYYY-MM-DD" último cierre de día      │
-│  lastClean  → "YYYY-MM-DD" última limpieza auto      │
 │  lastEmail  → "YYYY-MM-DD" último email automático   │
+│  emailPend  → bool: bandera de reporte pendiente sin enviar│
 │  lastReg    → buzón registro: "OK|uid|nombre|codigo|ts"│
 │  lastDel    → buzón borrado: "DELETED|..." / "NOT_FOUND|..."│
 │  emailDest  → email de destino para reportes         │
@@ -64,7 +64,7 @@ loop()
  ├── Detección WiFi nueva → NTP      ← sincronizar reloj al conectar
  ├── verificarNtpPendiente()         ← aplicar respuesta NTP async
  ├── Reintento WiFi (cada 30 s)      ← reconectar si se perdió
- ├── Tareas periódicas (cada 60 s)   ← cerrarDia + autoEmail + autoLimpieza
+ ├── Tareas periódicas (cada 60 s)   ← cerrarDia + autoEnviarEmail
  ├── Watchdog PN532 (cada 15 s)      ← verificar salud del chip NFC
  └── Lectura NFC (cada 300 ms)       ← leerUidUnaVez → procesar tarjeta
 ```
@@ -87,7 +87,7 @@ loop()
 | NTP | 531–610 | `aplicarTiempoNtp`, `iniciarNtp`, `verificarNtpPendiente`, `sincronizarNtpManual` |
 | Limpieza atómica | 611–640 | `resetearContadoresNvs`, `limpiarRegistros` |
 | Email SMTP | 641–780 | `enviarEmail`, `nombreAdjunto`, `tsParaNombre`, `smtpCallback` |
-| Cierre de día | 781–880 | `cerrarDiaArranque`, `cerrarDia`, `autoEnviarEmail`, `autoLimpiarLogs` |
+| Cierre de día | 781–880 | `cerrarDiaArranque`, `cerrarDia`, `autoEnviarEmail` |
 | Handlers web | 881–1350 | Un handler por cada ruta HTTP |
 | Watchdog NFC | 1351–1450 | `nfcReinicializar` |
 | NFC lectura | 1451–1480 | `uidAHex`, `leerUidUnaVez` |
@@ -106,7 +106,7 @@ El sistema nunca usa `delay()` en el flujo normal (solo en `nfcReinicializar()` 
 |---|---|---|
 | `ultimaLecturaNfc` | 300 ms | Cadencia de lectura del PN532 |
 | `nfcUltimoCheck` | 15 000 ms | Watchdog: verificar salud del PN532 |
-| `ultimoChequeoLimpieza` | 60 000 ms | Disparar `cerrarDia`, email auto, limpieza auto |
+| `ultimoChequeoLimpieza` | 60 000 ms | Disparar `cerrarDia` y `autoEnviarEmail` |
 | `ultimaReconexionWifi` | 30 000 ms | Reintentar WiFi si se perdió la conexión |
 | `tiempoLcdHasta` | variable | Duración del mensaje temporal en LCD (3–4 s típico) |
 | `lcdIdleDesde` | 120 000 ms | Retardo antes de iniciar el parpadeo del backlight |
@@ -441,3 +441,24 @@ Podría parecer redundante reconstruir `ARCHIVO_UIDS` en cada arranque si ya exi
 ### `lcdPost` como variable obsoleta
 
 La variable `lcdPost` (enum `LcdPost { LCD_IDLE, LCD_LISTO }`) se asigna en varios puntos del código pero ya no se usa en la decisión de qué mostrar al expirar `tiempoLcdHasta`. El bloque de expiración fue reescrito para consultar directamente `esperandoTarjeta` y `modoEliminar`. Las asignaciones de `lcdPost` son código inerte que permanece por compatibilidad con versiones anteriores; puede eliminarse sin efecto funcional.
+
+### Sistema de dos ventanas para auto-envío de correo y bandera de pendiente
+
+El borrado automático de archivos solo ocurre tras un envío de correo exitoso con `borrarTras=true`. No existe limpieza automática independiente del correo. El razonamiento: borrar sin enviar significaría pérdida de datos irrecuperable; el correo es la confirmación de que los datos están en destino.
+
+`autoEnviarEmail()` intenta el envío en dos ventanas horarias del día programado:
+
+```
+Hora 0 (medianoche) → intentar si WiFi disponible
+Hora 1–11           → no hacer nada (esperar mediodía)
+Hora 12 (mediodía)  → reintentar si WiFi disponible y no enviado aún
+Hora 13+            → ambas ventanas agotadas → activar emailPendienteFlag
+```
+
+La función corre cada 60 segundos. Dentro de cada ventana horaria, retrying each minute is useful for temporary WiFi drops. El guard `lastEmail == today` previene doble envío.
+
+La **bandera `emailPendienteFlag`** es un `bool` en RAM respaldado por `emailPend` (bool en NVS). Se inicializa desde NVS en `setup()` para sobrevivir reinicios. Se activa cuando `hora > 12` en un día de envío sin `lastEmail == today`. Se desactiva:
+1. Cuando `enviarEmail()` con `borrarTras=true` completa con éxito (situación resuelta automáticamente).
+2. Cuando el usuario hace clic en **✓ Confirmar** del banner y confirma en el diálogo JS (`handleConfirmarEmailPend()` limpia la bandera en NVS y redirige a `/`).
+
+`bannerAlerta()` es llamada desde `pagina()` en cada respuesta HTTP — si `emailPendienteFlag` es `false` retorna `""` y el overhead es nulo. Si es `true`, inyecta el div de advertencia al inicio del `<body>` en todas las páginas sin necesidad de modificar cada handler individualmente.
