@@ -18,6 +18,16 @@
 #define ARCHIVO_ENT   "/entradas.txt"
 #define ARCHIVO_UIDS  "/uids.txt"
 
+// ── LED RGB ───────────────────────────────────────────────────────────────────
+// GPIOs libres (no usados por I2C ni otros perifericos del sistema).
+// Pines ocupados: 18,19 (I2C RTC), 21,22 (I2C NFC+LCD).
+#define LED_PIN_R       25
+#define LED_PIN_G       26
+#define LED_PIN_B       27
+// true  = anodo comun   (HIGH = apagado, LOW = encendido en cada canal)
+// false = catodo comun  (LOW  = apagado, HIGH = encendido en cada canal)
+#define LED_ANODO_COMUN false
+
 // ── Credenciales SMTP del remitente (cambiar antes de compilar) ──
 #define SMTP_HOST        "smtp.gmail.com"
 #define SMTP_PORT        587   // 587=STARTTLS (Gmail recomendado) | 465=SSL implicito
@@ -87,6 +97,98 @@ const unsigned long LCD_BLINK_OFF_MS      = 50UL;   // s con luz apagada
 // si no responde, recupera el bus I2C y reinicializa el chip automaticamente.
 unsigned long nfcUltimoCheck = 0;
 const unsigned long NFC_CHECK_INTERVALO = 15000UL;  // verificar salud cada 15 s
+
+// ── LED RGB: maquina de estados no bloqueante ─────────────────────────────────
+// Estados:
+//   LED_IDLE     → amarillo fijo (espera normal)
+//   LED_FIJO     → color fijo durante 'ledFijoHasta' ms, luego vuelve a IDLE
+//   LED_PARPADEO → N destellos del color activo, luego vuelve a IDLE
+struct LedColor { bool r, g, b; };
+const LedColor LED_APAGADO  = {false, false, false};
+const LedColor LED_AMARILLO = {true,  true,  false};
+const LedColor LED_VERDE    = {false, true,  false};
+const LedColor LED_ROJO     = {true,  false, false};
+
+enum LedEstado { LED_IDLE, LED_FIJO, LED_PARPADEO };
+LedEstado     ledEstado      = LED_IDLE;
+LedColor      ledColorParpad = LED_VERDE;  // color del parpadeo en curso
+unsigned long ledFijoHasta   = 0;          // millis() hasta cuando mantener LED_FIJO
+int           ledCiclosRest  = 0;          // destellos restantes en LED_PARPADEO
+bool          ledFaseOn      = false;      // fase actual: true=encendido, false=apagado
+unsigned long ledProxCambio  = 0;          // millis() del proximo cambio de fase
+
+const unsigned long LED_BLINK_ON_MS  = 250;  // duracion fase encendida en parpadeo
+const unsigned long LED_BLINK_OFF_MS = 200;  // duracion fase apagada en parpadeo
+const int           LED_BLINK_N      =   5;  // numero de destellos por evento
+
+// ── LED RGB: funciones ───────────────────────────────────────────────────────
+// Escribe el color directamente respetando el tipo de LED (anodo/catodo comun).
+void ledAplicar(LedColor c) {
+  bool inv = LED_ANODO_COMUN;
+  digitalWrite(LED_PIN_R, inv ? !c.r : c.r);
+  digitalWrite(LED_PIN_G, inv ? !c.g : c.g);
+  digitalWrite(LED_PIN_B, inv ? !c.b : c.b);
+}
+
+// Activa un color fijo temporal; regresa a amarillo transcurridos 'ms' ms.
+void ledFijar(LedColor color, unsigned long ms) {
+  ledEstado    = LED_FIJO;
+  ledFijoHasta = millis() + ms;
+  ledAplicar(color);
+}
+
+// Inicia secuencia de 'n' destellos del color dado; regresa a amarillo al terminar.
+void ledParpadear(LedColor color, int n) {
+  ledEstado      = LED_PARPADEO;
+  ledColorParpad = color;
+  ledCiclosRest  = n;
+  ledFaseOn      = true;
+  ledProxCambio  = millis() + LED_BLINK_ON_MS;
+  ledAplicar(color);
+}
+
+// Actualizar maquina de estados; llamar en cada iteracion de loop().
+void ledActualizar() {
+  unsigned long ahora = millis();
+  switch (ledEstado) {
+    case LED_IDLE:
+      break;  // amarillo ya aplicado al entrar en este estado
+
+    case LED_FIJO:
+      if (ahora >= ledFijoHasta) {
+        ledEstado = LED_IDLE;
+        ledAplicar(LED_AMARILLO);
+      }
+      break;
+
+    case LED_PARPADEO:
+      if (ahora < ledProxCambio) break;
+      if (ledFaseOn) {
+        // Fase encendida terminada: pasar a fase apagada
+        ledFaseOn     = false;
+        ledProxCambio = ahora + LED_BLINK_OFF_MS;
+        ledAplicar(LED_APAGADO);
+      } else {
+        // Fase apagada terminada: decrementar y decidir si continuar
+        if (--ledCiclosRest <= 0) {
+          ledEstado = LED_IDLE;
+          ledAplicar(LED_AMARILLO);
+        } else {
+          ledFaseOn     = true;
+          ledProxCambio = ahora + LED_BLINK_ON_MS;
+          ledAplicar(ledColorParpad);
+        }
+      }
+      break;
+  }
+}
+
+void ledSetup() {
+  pinMode(LED_PIN_R, OUTPUT);
+  pinMode(LED_PIN_G, OUTPUT);
+  pinMode(LED_PIN_B, OUTPUT);
+  ledAplicar(LED_AMARILLO);  // estado inicial: espera normal
+}
 
 // Cancela el modo idle y garantiza backlight encendido.
 // Llamar antes de mostrar cualquier informacion activa en la LCD.
@@ -700,9 +802,11 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
       }
       Serial.println("EMAIL-AUTO: registros borrados, contadores reseteados, lastEmail actualizado.");
     }
+    ledParpadear(LED_VERDE, LED_BLINK_N);
   } else {
     emailEstado = "Error envio: " + smtp.errorReason();
     Serial.println("SMTP envio FALLO: " + smtp.errorReason());
+    ledParpadear(LED_ROJO, LED_BLINK_N);
   }
   smtp.closeSession();
   return ok;
@@ -1003,6 +1107,7 @@ void handleClearRegistros() {
   if (f) { while (f.available()) { if (f.read() == '\n') totalEnt++; } f.close(); }
 
   limpiarRegistros();  // borra ambos archivos y resetea contadores NVS
+  ledParpadear(LED_VERDE, LED_BLINK_N);
 
   servidor.send(200, "text/html", pagina("Registros borrados",
     "<h2>&#10003; Todos los registros borrados</h2><div class='card'>"
@@ -1328,6 +1433,7 @@ void setup() {
   Wire.begin(21, 22);
   Wire.setTimeOut(200);  // limitar cada transaccion I2C a 200 ms; evita cuelgues
   lcd.init(); lcd.backlight();
+  ledSetup();
   lcdMostrar("Sistema NFC", "Iniciando...", "", "");
 
   // NVS y LittleFS deben inicializarse antes que el RTC (buildID usa NVS)
@@ -1401,6 +1507,7 @@ void loop() {
 
   // Proteccion LCD: titileo no bloqueante
   lcdActualizarParpadeo();
+  ledActualizar();
 
   // Revertir LCD al mensaje idle cuando expira el timer de muestra de nombre
   if (tiempoLcdHasta && ahora >= tiempoLcdHasta) {
@@ -1466,6 +1573,7 @@ void loop() {
       Serial.println("TARJETA NO REGISTRADA: " + uid);
       lcdMostrar("No registrado", "", "", "");
       tiempoLcdHasta = millis() + 3000; lcdPost = LCD_IDLE;
+      ledFijar(LED_ROJO, 3000);
     } else {
       String claveCode = "k" + uid;
       String codigo    = almacen.getString(claveCode.c_str(), "");
@@ -1478,6 +1586,7 @@ void loop() {
       Serial.println("[" + ts + "] BORRADO: " + uid + " -> " + nombre);
       lcdMostrarNombre(nombre, codigo);
       tiempoLcdHasta = millis() + 3000; lcdPost = LCD_LISTO;
+      ledFijar(LED_VERDE, 3000);
     }
     resultadoEliminacion = true; modoEliminar = false; return;
   }
@@ -1494,6 +1603,7 @@ void loop() {
     lcdWakeUp();
     lcdMostrarNombre(nombrePendiente, codigoPendiente);
     tiempoLcdHasta = millis() + 4000; lcdPost = LCD_LISTO;
+    ledFijar(LED_VERDE, 4000);
     esperandoTarjeta = false; codigoPendiente = ""; nombrePendiente = ""; return;
   }
 
@@ -1537,4 +1647,5 @@ void loop() {
   lcdWakeUp();
   lcdMostrarNombre(nombre, codigo);
   tiempoLcdHasta = millis() + 4000; lcdPost = LCD_IDLE;
+  ledFijar(nombre != "NO_REGISTRADO" ? LED_VERDE : LED_ROJO, 4000);
 }
