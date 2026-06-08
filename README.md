@@ -297,7 +297,11 @@ El correo solo se envía si:
 - Hay un email de destino configurado.
 - No se ha enviado ya el correo ese mismo día (clave NVS `lastEmail`).
 
-**Si el ESP32 estaba apagado en la ventana de medianoche**, al arrancar entre las 0:01 y las 11:59 el sistema espera la ventana del mediodía para reintentar. Si arranca después de las 12:59 sin haber enviado, activa la alerta de reporte pendiente (ver sección siguiente).
+**Si el ESP32 estaba apagado en la ventana de medianoche**, al arrancar entre las 0:01 y las 11:59 el sistema espera la ventana del mediodía para reintentar. Si arranca después de las 12:59 sin haber enviado, activa la alerta de reporte pendiente.
+
+**Si el ESP32 estuvo apagado todo el día de envío** y arranca al día siguiente o más tarde, el sistema detecta el envío perdido comparando `lastEmail` con el último día de envío que debió haber ocurrido y activa la alerta de reporte pendiente si hay datos en los archivos de registro.
+
+**Primera instalación:** En el primer arranque con código nuevo, el sistema registra la fecha de compilación como punto de partida para evitar falsos positivos. La primera fecha real de envío automático será el siguiente día programado (10, 20 o último del mes) después de la instalación.
 
 ### Contenido del correo
 
@@ -389,19 +393,21 @@ La responsabilidad de descargar los logs manualmente y borrar la memoria antes d
 
 **Síntoma:** Todas las páginas de la web muestran un banner amarillo de advertencia sobre un reporte no enviado.
 
-**Causas y soluciones:**
+**Cuándo aparece:**
 
-- **Ambas ventanas de envío fallaron:** El día de envío (10, 20 o último del mes), el sistema intentó enviar correo a medianoche y al mediodía, pero ambas fallaron (sin WiFi, sin corriente o error SMTP). Los archivos de registro no fueron borrados.
-- **El sistema estuvo apagado todo el día de envío:** Si el ESP32 no estaba encendido en ninguna de las dos ventanas y arrancó después de las 12:59 de ese día, activa la alerta directamente.
+- **Ambas ventanas de envío fallaron en el mismo día:** El sistema intentó a medianoche y al mediodía, pero ambas fallaron (sin WiFi o error SMTP). Los archivos no fueron borrados.
+- **El sistema estuvo apagado el día de envío y arrancó después:** Si el ESP32 volvió a encender en un día posterior al día de envío y el correo nunca se mandó, el banner aparece al detectar el historial sin enviar.
+
+> **Nota:** El banner persiste en todos los reinicios hasta que el usuario lo confirma manualmente. Es intencional que no desaparezca solo.
 
 **Qué hacer:**
 
-1. Ir a `/logs` y descargar el CSV de accesos.
-2. Ir a `/entradas` y descargar el CSV de entradas/salidas.
-3. Opcionalmente, usar el botón "Enviar por email" si el WiFi tiene internet ahora (esto enviará el correo y borrará los archivos automáticamente).
-4. Si se borraron los archivos manualmente (`/clearRegistros`), hacer clic en **✓ Confirmar** del banner y confirmar que ya se descargaron los datos.
+1. Ir a `/logs` y descargar el CSV de accesos (botón "Descargar CSV").
+2. Ir a `/entradas` y descargar el CSV de entradas/salidas (botón "Descargar CSV").
+3. Opcionalmente, usar el botón **"Enviar por email"** en `/logs`. Esto envía los archivos al correo configurado **pero no los borra** (el envío manual nunca borra archivos). Para borrar, ir a `/clearRegistros`.
+4. Una vez que hayas guardado los datos y borrado la memoria (o decidido no hacerlo), hacer clic en **✓ Confirmar** del banner. El navegador preguntará "¿Ya descargaste los logs y borraste la memoria?". Al confirmar, el banner desaparece.
 
-El banner desaparece al confirmar. No desaparece solo si solo se descargaron o solo se borraron los archivos — requiere confirmación explícita.
+> **Importante:** El banner desaparece únicamente al hacer clic en **✓ Confirmar** y aceptar el diálogo. No desaparece solo al descargar ni al borrar los archivos — la confirmación es siempre explícita. Si el usuario confirma sin haber descargado los datos, el sistema acepta esa decisión.
 
 ### El sistema no detecta el cambio de día (Salidas Pendientes no aparecen)
 

@@ -290,7 +290,17 @@ void rtcSincronizarSiNecesario() {
   bool perdioAlim    = rtcDs3231.lostPower();
   if (firmwareNuevo || perdioAlim) {
     rtcAjustarHora(anio, mes, dia, hora, minuto, segundo);
-    if (firmwareNuevo) almacen.putString("buildID", buildIdActual);
+    if (firmwareNuevo) {
+      almacen.putString("buildID", buildIdActual);
+      // En primer arranque absoluto (lastEmail vacio), inicializar lastEmail a la fecha de
+      // compilacion para evitar falso positivo de "envio perdido" si la carga ocurre en
+      // un dia de envio. La primera fecha real de envio sera la proxima programada.
+      if (!almacen.getString("lastEmail", "").length()) {
+        char fechaComp[11]; snprintf(fechaComp, sizeof(fechaComp), "%04d-%02d-%02d", anio, mes, dia);
+        almacen.putString("lastEmail", String(fechaComp));
+        Serial.println("RTC: primer arranque — lastEmail inicializado a " + String(fechaComp));
+      }
+    }
     Serial.println(firmwareNuevo ? "RTC: hora actualizada (nuevo firmware)."
                                  : "RTC: hora actualizada (perdida de alimentacion).");
   } else {
@@ -937,34 +947,87 @@ void cerrarDia() {
   Serial.printf("CIERRE-DIA: completado, %d UIDs procesados\n", nu);
 }
 
+// Retorna la fecha "YYYY-MM-DD" del dia de envio mas reciente que ya ha pasado
+// (estrictamente anterior al dia actual). Si hoy mismo es un dia de envio, ese dia
+// solo se considera "pasado" si hora > 12 (ambas ventanas agotadas).
+// Considera dias de envio: 10, 20 y ultimo dia del mes.
+String calcularUltimoEnvioPasado(int anio, int mes, int dia, int ud) {
+  int candidatos[] = {10, 20, ud};
+  // Buscar el mayor dia de envio en el mes actual que sea < dia
+  int mejorDia = -1;
+  for (int i = 0; i < 3; i++) {
+    if (candidatos[i] < dia && candidatos[i] > mejorDia) mejorDia = candidatos[i];
+  }
+  char buf[11];
+  if (mejorDia > 0) {
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", anio, mes, mejorDia);
+    return String(buf);
+  }
+  // Sin candidatos este mes → buscar en el mes anterior
+  int mesPrev = mes - 1, anioPrev = anio;
+  if (mesPrev == 0) { mesPrev = 12; anioPrev--; }
+  if (anioPrev < 2020) return "";
+  int udPrev = ultimoDiaDelMes(mesPrev, anioPrev);
+  int diasPrev[] = {10, 20, udPrev};
+  mejorDia = -1;
+  for (int i = 0; i < 3; i++) if (diasPrev[i] > mejorDia) mejorDia = diasPrev[i];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d", anioPrev, mesPrev, mejorDia);
+  return String(buf);
+}
+
 // ── Auto-envio de email en dias fijos del mes ─────────────────
-// Ventana 1: hora 0 (medianoche). Ventana 2: hora 12 (mediodia, reintento si fallo la 1).
-// Si ambas ventanas pasan sin envio exitoso, activa emailPendienteFlag para alertar al usuario.
+// Ventana 1: hora 0 (medianoche). Ventana 2: hora 12 (mediodia).
+// Detecta ademas envios perdidos de dias anteriores (ESP apagado todo el dia de envio).
 void autoEnviarEmail() {
   if (!rtcDisponible) return;
   if (!almacen.getString("emailDest", "").length()) return;
 
   FechaHora fh = rtcLeerFechaHora();
   int ud = ultimoDiaDelMes(fh.mes, fh.anio);
-  if (fh.dia != 10 && fh.dia != 20 && fh.dia != ud) return;
-
   char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
-  if (almacen.getString("lastEmail", "") == String(hoy)) return;  // ya enviado hoy
+  bool esDiaEnvio = (fh.dia == 10 || fh.dia == 20 || fh.dia == ud);
+  String lastEmail = almacen.getString("lastEmail", "");
+
+  // ── Deteccion de envio perdido en dias anteriores ─────────────
+  // Solo cuando ya hubo un envio previo (lastEmail no vacio) y las ventanas del dia
+  // de envio actual aun estan abiertas no se evalua (hora <= 12 en dia de envio).
+  // Evita activar la bandera mientras el dia de envio actual todavia puede completarse.
+  if (!emailPendienteFlag && lastEmail.length() > 0 && !(esDiaEnvio && fh.hora <= 12)) {
+    String ultimoPasado = calcularUltimoEnvioPasado(fh.anio, fh.mes, fh.dia, ud);
+    if (ultimoPasado.length() && lastEmail < ultimoPasado) {
+      // Solo activar si hay datos que proteger (logs no vacios)
+      File fLog = LittleFS.open(ARCHIVO_LOG, "r");
+      bool hayDatos = fLog && fLog.size() > 0;
+      if (fLog) fLog.close();
+      if (hayDatos) {
+        emailPendienteFlag = true;
+        almacen.putBool("emailPend", true);
+        Serial.println("AUTO-EMAIL: envio perdido (" + lastEmail + " < " + ultimoPasado + "), bandera activada");
+      }
+    }
+  }
+
+  // ── Intentar envio en dias y ventanas programadas ─────────────
+  if (!esDiaEnvio) return;
+  if (lastEmail == String(hoy)) return;  // ya enviado hoy
 
   if (fh.hora == 0 || fh.hora == 12) {
-    // Intentar solo si hay internet disponible; si no, reintentar en el proximo ciclo de 60 s
     if (WiFi.status() != WL_CONNECTED) return;
     Serial.printf("AUTO-EMAIL: ventana hora %d, generando CSV...\n", fh.hora);
     bool ok = enviarEmail(logCsv(), entradaCsv(), true);
     Serial.println(ok ? "AUTO-EMAIL enviado: " + String(hoy)
                       : "AUTO-EMAIL: fallo en ventana hora " + String(fh.hora));
-    // Si fallo pero es hora 12 (segunda ventana), la bandera se activara al pasar a hora > 12
   } else if (fh.hora > 12) {
     // Ambas ventanas del dia ya pasaron sin envio exitoso
     if (!emailPendienteFlag) {
-      emailPendienteFlag = true;
-      almacen.putBool("emailPend", true);
-      Serial.println("AUTO-EMAIL: ambas ventanas agotadas, bandera pendiente activada.");
+      File fLog = LittleFS.open(ARCHIVO_LOG, "r");
+      bool hayDatos = fLog && fLog.size() > 0;
+      if (fLog) fLog.close();
+      if (hayDatos) {
+        emailPendienteFlag = true;
+        almacen.putBool("emailPend", true);
+        Serial.println("AUTO-EMAIL: ambas ventanas agotadas, bandera pendiente activada.");
+      }
     }
   }
   // hora 1-11: esperar la ventana del mediodia; no hacer nada

@@ -54,7 +54,8 @@ All logic lives in [src/main.cpp](src/main.cpp) (~650 lines). There are no heade
 | `<uid>`       | User name string                                |
 | `"k" + <uid>` | User code (1–6 alphanumeric chars)              |
 | `buildID`     | `__DATE__ + __TIME__` — detects new firmware    |
-| `lastClean`   | `YYYY-MM-DD` — prevents double auto-cleanup     |
+| `lastEmail`   | `YYYY-MM-DD` — last successful auto-send date   |
+| `emailPend`   | bool — pending report alert flag                |
 | `lastReg`     | Polling mailbox: `OK\|uid\|name\|code\|ts`      |
 | `lastDel`     | Polling mailbox: `DELETED\|…` or `NOT_FOUND\|…` |
 
@@ -84,7 +85,7 @@ All logic lives in [src/main.cpp](src/main.cpp) (~650 lines). There are no heade
 
 **LCD non-blocking timer:** `tiempoLcdHasta` (ms) + `lcdPost` enum control display: after showing a name for 3–4 s, `loop()` reverts the screen to `"Esperando tarjeta..."` (idle) or `"Listo"` without blocking.
 
-**Auto-cleanup:** Checked every 60 s; runs at hour 00:xx on the 15th and last day of each month. Deletes `/logs.txt` only — NVS registry is preserved. `lastClean` NVS key prevents double-execution on the same day.
+**Auto-email:** Checked every 60 s via `autoEnviarEmail()`. Sends on days 10, 20, and last of month. Two send windows: hour 0 (midnight) and hour 12 (noon retry). On successful send (`borrarTras=true`), deletes both log files and resets NVS counters. If both windows pass without sending and log data exists, sets `emailPend` NVS flag; a warning banner appears on all web pages until the user clicks Confirm. Also detects missed send days from previous dates by comparing `lastEmail` against the most recent past send day.
 
 **RTC sync:** On first boot after a new firmware upload (`buildID` mismatch), the RTC is set to compile-time `__DATE__`/`__TIME__`. On subsequent boots the time is left intact but control registers are restored. Timestamp format: `YYYY-MM-DD HH:MM:SS`.
 
@@ -105,9 +106,11 @@ All logic lives in [src/main.cpp](src/main.cpp) (~650 lines). There are no heade
 | `obtenerTimestamp()`          | Returns `YYYY-MM-DD HH:MM:SS` string from RTC (validates range) |
 | `logAgregar()`                | Appends a `timestamp\|uid\|nombre\|codigo` line to LittleFS     |
 | `logParsear()`                | Parses a log line; handles 3- and 4-field formats               |
-| `logHtml()` / `logTexto()`    | Renders logs as HTML table or plain-text download               |
-| `autoLimpiarLogs()`           | Bi-monthly log auto-cleanup (called from `loop()`)              |
-| `pagina()`                    | Wraps HTML body with doctype, viewport meta, and shared styles  |
+| `logHtml()` / `logTexto()`        | Renders logs as HTML table or plain-text download                     |
+| `autoEnviarEmail()`               | Two-window auto-send + missed-send detection + pending flag           |
+| `calcularUltimoEnvioPasado()`     | Computes most recent past send day for missed-send detection          |
+| `bannerAlerta()`                  | Returns warning HTML div if `emailPendienteFlag` is active            |
+| `pagina()`                        | Wraps HTML body with doctype, viewport meta, shared styles, and banner|
 
 ## Dependencies
 
