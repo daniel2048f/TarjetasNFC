@@ -1008,6 +1008,8 @@ void handleSaveName() {
   }
   esperandoTarjeta = true; modoEliminar = false;
   tarjetaPresente = false; ultimoUid = ""; tiempoUltimoUid = 0;
+  tiempoLcdHasta = 0;  // cancelar timer pendiente; no debe sobreescribir ni activar blink
+  lcdWakeUp();
   lcdMostrar("Registrando:", nombrePendiente, "Acerca tarjeta", "");
   servidor.send(200, "text/html", pagina("Acerca la tarjeta",
     "<h2>Acerca la tarjeta</h2><div class='card'>"
@@ -1023,6 +1025,8 @@ void handleSaveName() {
 void handleDeleteUser() {
   esperandoTarjeta = false; modoEliminar = true; nombrePendiente = ""; codigoPendiente = "";
   tarjetaPresente = false; ultimoUid = ""; tiempoUltimoUid = 0;
+  tiempoLcdHasta = 0;  // cancelar timer pendiente; no debe sobreescribir ni activar blink
+  lcdWakeUp();
   lcdMostrar("Modo eliminar", "Acerca tarjeta", "", "");
   servidor.send(200, "text/html", pagina("Borrar usuario",
     "<h2>Borrar usuario</h2><div class='card' style='border-color:#dc3545'>"
@@ -1129,7 +1133,9 @@ void handleDownloadLogs() {
 void handleCancelar() {
   esperandoTarjeta = false; modoEliminar = false; nombrePendiente = ""; codigoPendiente = "";
   tarjetaPresente = false; ultimoUid = ""; tiempoUltimoUid = 0;
+  lcdWakeUp();
   lcdMostrar("Cancelado", "", "", "");
+  tiempoLcdHasta = millis() + 2000;  // transicion limpia a idle: blink empieza desde cero
   servidor.send(200, "text/html", pagina("Cancelado",
     "<h2>Operacion cancelada</h2><div class='card'>"
     "<p class='muted'>No se realizo ningun cambio.</p>"
@@ -1373,13 +1379,16 @@ void nfcReinicializar() {
   if (v) {
     lectorNfc.SAMConfig();
     Serial.println("NFC WDG: PN532 OK, Fw v" + String((v >> 16) & 0xFF));
-    // Restaurar mensaje idle solo si no hay un mensaje activo
+    // Restaurar el mensaje correcto segun el estado actual del sistema
     if (!tiempoLcdHasta) {
-      lcdMostrar("Esperando", "tarjeta...", "", "");
+      if      (esperandoTarjeta) lcdMostrar("Registrando:", nombrePendiente, "Acerca tarjeta", "");
+      else if (modoEliminar)     lcdMostrar("Modo eliminar", "Acerca tarjeta", "", "");
+      else                       lcdMostrar("Esperando", "tarjeta...", "", "");
       lcdIdleDesde = millis(); lcdParpadeoNext = 0;
     }
   } else {
     Serial.println("NFC WDG: PN532 no responde tras reinicio");
+    lcdWakeUp();
     lcdMostrar("NFC ERROR", "Revisar lector", "", "");
   }
   nfcUltimoCheck = millis();  // reiniciar el intervalo de verificacion
@@ -1509,11 +1518,12 @@ void loop() {
   lcdActualizarParpadeo();
   ledActualizar();
 
-  // Revertir LCD al mensaje idle cuando expira el timer de muestra de nombre
+  // Al expirar el timer, mostrar el mensaje que corresponde al estado real actual
   if (tiempoLcdHasta && ahora >= tiempoLcdHasta) {
     tiempoLcdHasta = 0;
-    if (lcdPost == LCD_IDLE) lcdMostrar("Esperando", "tarjeta...", "", "");
-    else                     lcdMostrar("Listo", "", "", "");
+    if      (esperandoTarjeta) lcdMostrar("Registrando:", nombrePendiente, "Acerca tarjeta", "");
+    else if (modoEliminar)     lcdMostrar("Modo eliminar", "Acerca tarjeta", "", "");
+    else                       lcdMostrar("Esperando", "tarjeta...", "", "");
     lcdIdleDesde    = ahora;  // activar proteccion LCD al entrar en idle
     lcdParpadeoNext = 0;
   }
