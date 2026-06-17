@@ -14,13 +14,21 @@
 // I2C: busRtc(SDA=19,SCL=18)→RTC DS3231 | Wire(SDA=21,SCL=22)→PN532+LCD(0x27)
 #define RTC_SDA       19
 #define RTC_SCL       18
+#define I2C_SDA       21
+#define I2C_SCL       22
+// PN532 IRQ y RESET: pines libres (NO usar 21/22 que son SDA/SCL del bus I2C).
+// Si el hardware no conecta IRQ/RST al ESP32, el constructor los usara como
+// pines "dummy": IRQ queda como INPUT flotante, RESET se togglea sin efecto.
+#define PN532_IRQ     5    // libre; no conectado al PN532 en este hardware
+#define PN532_RESET   4    // libre; no conectado al PN532 en este hardware
 #define ARCHIVO_LOG   "/logs.txt"
 #define ARCHIVO_ENT   "/entradas.txt"
 #define ARCHIVO_UIDS  "/uids.txt"
 
 // ── LED RGB ───────────────────────────────────────────────────────────────────
 // GPIOs libres (no usados por I2C ni otros perifericos del sistema).
-// Pines ocupados: 18,19 (I2C RTC), 21,22 (I2C NFC+LCD).
+// Pines ocupados: 4 (PN532 RST dummy), 5 (PN532 IRQ dummy),
+//                 18,19 (I2C RTC), 21,22 (I2C NFC+LCD).
 #define LED_PIN_R       25
 #define LED_PIN_G       26
 #define LED_PIN_B       27
@@ -36,7 +44,7 @@
 
 TwoWire           busRtc = TwoWire(1);
 RTC_DS3231        rtcDs3231;
-Adafruit_PN532    lectorNfc(21, 22);
+Adafruit_PN532    lectorNfc(PN532_IRQ, PN532_RESET, &Wire);
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
 const char* SSID_AP  = "NFC";
@@ -87,9 +95,9 @@ LcdPost lcdPost = LCD_IDLE;
 bool          lcdBacklightOn  = true;
 unsigned long lcdIdleDesde    = 0;     // millis() al entrar en idle; 0 = no idle
 unsigned long lcdParpadeoNext = 0;     // proxima inversion del backlight
-const unsigned long LCD_IDLE_BLINK_INICIO = 5000UL; // 5 seg idle antes de titular
-const unsigned long LCD_BLINK_ON_MS       = 300UL;   // s con luz encendida
-const unsigned long LCD_BLINK_OFF_MS      = 50UL;   // s con luz apagada
+const unsigned long LCD_IDLE_BLINK_INICIO = 30000UL; // 30 s idle antes de parpadear
+const unsigned long LCD_BLINK_ON_MS       = 29700UL; // luz encendida ~30 s entre blinks
+const unsigned long LCD_BLINK_OFF_MS      = 300UL;   // luz apagada 300 ms (parpadeo breve)
 
 // ── PN532 watchdog ────────────────────────────────────────────
 // El PN532 puede quedar en estado inconsistente si recibe una secuencia I2C
@@ -98,6 +106,14 @@ const unsigned long LCD_BLINK_OFF_MS      = 50UL;   // s con luz apagada
 // si no responde, recupera el bus I2C y reinicializa el chip automaticamente.
 unsigned long nfcUltimoCheck = 0;
 const unsigned long NFC_CHECK_INTERVALO = 15000UL;  // verificar salud cada 15 s
+const unsigned long NFC_RETRY_RAPIDO    =  2000UL;  // reintento rapido si no disponible
+
+bool          nfcDisponible         = false;
+uint32_t      nfcReinicios          = 0;   // veces que se activo recuperacion
+uint32_t      nfcFallosConsecutivos = 0;
+unsigned long nfcUltimaLecturaOk    = 0;
+String        nfcUltimoError        = "";
+uint32_t      nfcVersionFirmware    = 0;
 
 // ── LED RGB: maquina de estados no bloqueante ─────────────────────────────────
 // Estados:
@@ -1413,39 +1429,83 @@ void handleSyncNtp() {
     "<a href='/config'><button>Volver</button></a></div>"));
 }
 
+// ── NFC: inicializacion robusta ───────────────────────────────────────────────
+// Configura Wire, llama begin(), verifica firmware y solo entonces llama SAMConfig.
+// No reinicia el bus I2C; llamar Wire.begin() antes si se requiere recuperacion.
+bool nfcInicializar(const char* motivo) {
+  Serial.printf("NFC INIT [%s]: iniciando...\n", motivo);
+  tarjetaPresente    = false;
+  ultimoUid          = "";
+  tiempoUltimoUid    = 0;
+  nfcVersionFirmware = 0;
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);   // 100 kHz: mayor estabilidad en bus compartido
+  Wire.setTimeOut(200);    // max 200 ms por transaccion; evita cuelgues
+  delay(10);
+
+  // begin() usa PN532_RESET (GPIO4) y PN532_IRQ (GPIO5), NO el bus I2C.
+  // Con pines dummy no conectados al PN532: el chip no recibe RESET fisico
+  // pero la secuencia se completa en GPIO4 sin afectar SDA/SCL.
+  lectorNfc.begin();
+  // Re-aplicar clock y timeout: begin() llama Wire.begin() internamente
+  Wire.setClock(100000);
+  Wire.setTimeOut(200);
+  delay(100);
+
+  uint32_t v = lectorNfc.getFirmwareVersion();
+  if (!v) {
+    nfcUltimoError        = "getFirmwareVersion=0";
+    nfcDisponible         = false;
+    nfcFallosConsecutivos++;
+    Serial.printf("NFC INIT [%s]: PN532 no responde\n", motivo);
+    return false;
+  }
+
+  nfcVersionFirmware    = v;
+  Serial.printf("NFC INIT [%s]: firmware v%d.%d — SAMConfig...\n",
+                motivo, (v >> 16) & 0xFF, (v >> 8) & 0xFF);
+  lectorNfc.SAMConfig();
+  lectorNfc.setPassiveActivationRetries(3);
+
+  nfcDisponible         = true;
+  nfcFallosConsecutivos = 0;
+  nfcUltimoError        = "";
+  Serial.printf("NFC INIT [%s]: OK\n", motivo);
+  return true;
+}
+
 // ── NFC watchdog: recuperacion de bus I2C y reinicio del PN532 ────────────────
-// Secuencia de recuperacion:
+// Secuencia:
 //  1. Liberar el periferico I2C del ESP32.
-//  2. Generar 9 pulsos en SCL (estandar I2C §3.1.16) para liberar un slave bloqueado.
-//  3. Enviar condicion STOP para restaurar el bus a estado libre.
-//  4. Reinicializar Wire + LCD + PN532 y volver al estado idle.
+//  2. 9 pulsos en SCL (estandar I2C §3.1.16) para liberar un slave bloqueado.
+//  3. Condicion STOP para restaurar el bus a estado libre.
+//  4. Reinicializar Wire + LCD + PN532 via nfcInicializar().
 void nfcReinicializar() {
-  Serial.println("NFC WDG: recuperando bus I2C y reinicializando PN532...");
+  nfcReinicios++;
+  Serial.printf("NFC WDG: recuperando bus I2C (intento #%d)...\n", nfcReinicios);
 
   // Paso 1: Liberar el periferico I2C del ESP32
   Wire.end();
   delayMicroseconds(500);
 
-  // Paso 2: 9 pulsos SCL para liberar cualquier slave que tenga SDA bloqueado en bajo
-  pinMode(22, OUTPUT);       // SCL como salida
-  pinMode(21, INPUT_PULLUP); // SDA como entrada con pull-up (monitorear si esta libre)
-  digitalWrite(22, HIGH);
+  // Paso 2: 9 pulsos SCL para liberar cualquier slave con SDA bloqueado en bajo
+  pinMode(I2C_SCL, OUTPUT);
+  pinMode(I2C_SDA, INPUT_PULLUP);
+  digitalWrite(I2C_SCL, HIGH);
   delayMicroseconds(10);
   for (int i = 0; i < 9; i++) {
-    digitalWrite(22, LOW);  delayMicroseconds(5);
-    digitalWrite(22, HIGH); delayMicroseconds(5);
+    digitalWrite(I2C_SCL, LOW);  delayMicroseconds(5);
+    digitalWrite(I2C_SCL, HIGH); delayMicroseconds(5);
   }
 
   // Paso 3: Condicion STOP (SDA sube mientras SCL esta en alto)
-  pinMode(21, OUTPUT);
-  digitalWrite(21, LOW);  delayMicroseconds(5);
-  // SCL ya esta HIGH
-  digitalWrite(21, HIGH); delayMicroseconds(5);
+  pinMode(I2C_SDA, OUTPUT);
+  digitalWrite(I2C_SDA, LOW);  delayMicroseconds(5);
+  digitalWrite(I2C_SDA, HIGH); delayMicroseconds(5);
   delay(10);
 
-  // Paso 4: Reinicializar Wire con timeout para evitar bloqueos futuros
-  Wire.begin(21, 22);
-  Wire.setTimeOut(200);  // max 200 ms por transaccion I2C; evita cuelgues infinitos
+  // Paso 4: Reinicializar Wire (nfcInicializar lo hace internamente)
   delay(50);
 
   // Paso 5: Reinicializar LCD (puede haber perdido estado durante la recuperacion)
@@ -1454,20 +1514,9 @@ void nfcReinicializar() {
   lcdBacklightOn = true;
   delay(10);
 
-  // Paso 6: Reinicializar PN532
-  // lectorNfc.begin() incluye un pulso RESET de ~500 ms en el pin configurado
-  // como RESET (pin 22 = SCL en este hardware); es parte del protocolo del chip.
-  lectorNfc.begin();
-  delay(100);
-  // Re-afirmar Wire despues de que begin() pudo haber reconfigurado los pines
-  Wire.begin(21, 22);
-  Wire.setTimeOut(200);
-
-  uint32_t v = lectorNfc.getFirmwareVersion();
-  if (v) {
-    lectorNfc.SAMConfig();
-    Serial.println("NFC WDG: PN532 OK, Fw v" + String((v >> 16) & 0xFF));
-    // Restaurar el mensaje correcto segun el estado actual del sistema
+  // Paso 6: Inicializar PN532 (PN532_RESET=GPIO4 no afecta el bus I2C)
+  bool ok = nfcInicializar("recovery");
+  if (ok) {
     if (!tiempoLcdHasta) {
       if      (esperandoTarjeta) lcdMostrar("Registrando:", nombrePendiente, "Acerca tarjeta", "");
       else if (modoEliminar)     lcdMostrar("Modo eliminar", "Acerca tarjeta", "", "");
@@ -1475,11 +1524,40 @@ void nfcReinicializar() {
       lcdIdleDesde = millis(); lcdParpadeoNext = 0;
     }
   } else {
-    Serial.println("NFC WDG: PN532 no responde tras reinicio");
     lcdWakeUp();
-    lcdMostrar("NFC ERROR", "Revisar lector", "", "");
+    lcdMostrar("NFC ERROR", "Reintentando...", "", "");
   }
-  nfcUltimoCheck = millis();  // reiniciar el intervalo de verificacion
+  nfcUltimoCheck = millis();
+}
+
+// ── Handler: diagnostico NFC ─────────────────────────────────
+void handleNfcDiag() {
+  unsigned long ahora = millis();
+  String ultimaOk = "Nunca";
+  if (nfcUltimaLecturaOk > 0) {
+    unsigned long segs = (ahora - nfcUltimaLecturaOk) / 1000;
+    if (segs < 60)        ultimaOk = "hace " + String(segs) + " s";
+    else if (segs < 3600) ultimaOk = "hace " + String(segs / 60) + " min";
+    else                  ultimaOk = "hace " + String(segs / 3600) + " h";
+  }
+  String fwStr = nfcVersionFirmware
+    ? "v" + String((nfcVersionFirmware >> 16) & 0xFF) + "." + String((nfcVersionFirmware >> 8) & 0xFF)
+    : "no detectado";
+  String estado = esperandoTarjeta ? "Registrar usuario"
+                : modoEliminar     ? "Eliminar usuario"
+                :                    "Normal";
+  servidor.send(200, "text/html", pagina("NFC Diagnostico",
+    "<h2>NFC Diagnostico</h2><div class='card'>"
+    "<p>Disponible: <b style='color:" + String(nfcDisponible ? "#28a745" : "#dc3545") + "'>"
+    + String(nfcDisponible ? "SI" : "NO") + "</b></p>"
+    "<p>Firmware: <b>" + fwStr + "</b></p>"
+    "<p>Ultimo error: <b>" + (nfcUltimoError.length() ? nfcUltimoError : "ninguno") + "</b></p>"
+    "<p>Reinicios NFC: <b>" + String(nfcReinicios) + "</b></p>"
+    "<p>Fallos consecutivos: <b>" + String(nfcFallosConsecutivos) + "</b></p>"
+    "<p>Ultima lectura OK: <b>" + ultimaOk + "</b></p>"
+    "<p>Heap libre: <b>" + String(ESP.getFreeHeap()) + " bytes</b></p>"
+    "<p>Estado actual: <b>" + estado + "</b></p>"
+    "<br><a href='/'><button>Volver</button></a></div>"));
 }
 
 // ── NFC ──────────────────────────────────────────────────────
@@ -1492,15 +1570,18 @@ String uidAHex(byte* uid, byte longitud) {
 bool leerUidUnaVez(String &uidSalida) {
   byte uid[7]; byte longitud = 0;
 
-  // Medir cuanto tarda la llamada: con timeout=50ms deberia resolverse en <120ms.
-  // Si tarda mas, hay un problema en el bus I2C o el chip esta bloqueado.
   unsigned long t0 = millis();
-  bool hayTarjeta = lectorNfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &longitud, 50);
+  bool hayTarjeta = lectorNfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &longitud, 100);
   unsigned long dt = millis() - t0;
-  if (dt > 120) {
-    // Lectura anormalmente lenta: forzar verificacion de salud en el proximo ciclo
+  if (dt > 250) {
     Serial.printf("NFC: lectura lenta (%lums) — posible problema I2C\n", dt);
-    nfcUltimoCheck = 0;
+    nfcUltimoError = "lectura lenta " + String(dt) + "ms";
+    nfcFallosConsecutivos++;
+    nfcUltimoCheck = 0;  // forzar verificacion de salud en el proximo ciclo
+  }
+  if (hayTarjeta) {
+    nfcFallosConsecutivos = 0;
+    nfcUltimaLecturaOk    = millis();
   }
 
   if (!hayTarjeta) {
@@ -1527,7 +1608,8 @@ bool leerUidUnaVez(String &uidSalida) {
 void setup() {
   Serial.begin(115200); delay(500);
 
-  Wire.begin(21, 22);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
   Wire.setTimeOut(200);  // limitar cada transaccion I2C a 200 ms; evita cuelgues
   lcd.init(); lcd.backlight();
   ledSetup();
@@ -1549,16 +1631,11 @@ void setup() {
     Serial.println("AVISO: DS3231 no encontrado. Usando millis().");
   }
 
-  lectorNfc.begin();
-  // Re-afirmar Wire tras begin() que puede reconfigurar los pines 21/22
-  Wire.begin(21, 22);
-  Wire.setTimeOut(200);
-  uint32_t vFirmware = lectorNfc.getFirmwareVersion();
-  Serial.println(vFirmware
-    ? "PN532 OK. Fw v" + String((vFirmware >> 16) & 0xFF)
-    : "ERROR: PN532 no detectado!");
-  lectorNfc.SAMConfig();
-  nfcUltimoCheck = millis();  // iniciar el intervalo del watchdog desde ahora
+  nfcInicializar("setup");
+  if (!nfcDisponible) {
+    lcdMostrar("NFC: sin lector", "Reintentando...", "", "");
+  }
+  nfcUltimoCheck = millis();
 
   // Modo AP+STA: Access Point para clientes locales + cliente WiFi para internet
   WiFi.mode(WIFI_AP_STA);
@@ -1593,6 +1670,7 @@ void setup() {
   servidor.on("/sendEmail",           handleSendEmail);
   servidor.on("/syncNtp",             handleSyncNtp);
   servidor.on("/confirmarEmailPend",  handleConfirmarEmailPend);
+  servidor.on("/nfcdiag",             handleNfcDiag);
   servidor.begin();
   Serial.println("Servidor web iniciado!");
 
@@ -1645,20 +1723,28 @@ void loop() {
     autoEnviarEmail(); // 2: enviar email (incluye las Salidas Pendientes recien marcadas)
   }
 
-  // Watchdog PN532: verificar salud del chip cada NFC_CHECK_INTERVALO ms.
-  // getFirmwareVersion() retorna 0 si el chip no responde (bus bloqueado o chip colgado).
-  // Con Wire.setTimeOut(200) esta llamada tarda como maximo 200 ms si el chip no responde.
-  if (ahora - nfcUltimoCheck >= NFC_CHECK_INTERVALO) {
-    nfcUltimoCheck = ahora;
-    if (!lectorNfc.getFirmwareVersion()) {
-      Serial.println("NFC WDG: chip no responde — iniciando recuperacion automatica");
-      nfcReinicializar();
-      return;  // reiniciar el loop con el estado restaurado
+  // Watchdog PN532: intervalo corto (2 s) si no disponible; largo (15 s) si disponible.
+  // getFirmwareVersion() tarda max 200 ms si el chip no responde (Wire.setTimeOut).
+  {
+    unsigned long intervalo = nfcDisponible ? NFC_CHECK_INTERVALO : NFC_RETRY_RAPIDO;
+    if (ahora - nfcUltimoCheck >= intervalo) {
+      nfcUltimoCheck = ahora;
+      if (!lectorNfc.getFirmwareVersion()) {
+        if (nfcDisponible) Serial.println("NFC WDG: chip no responde — recuperando");
+        nfcDisponible = false;
+        nfcReinicializar();
+        return;
+      } else if (!nfcDisponible) {
+        // Chip responde pero nunca tuvo SAMConfig: inicializar completamente
+        nfcInicializar("watchdog-ok");
+      }
     }
   }
 
   if (ahora - ultimaLecturaNfc < INTERVALO_NFC) return;
   ultimaLecturaNfc = ahora;
+
+  if (!nfcDisponible) return;  // no intentar leer si el chip no esta listo
 
   String uid;
   if (!leerUidUnaVez(uid)) return;
