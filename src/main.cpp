@@ -100,7 +100,7 @@ const unsigned long LCD_BLINK_OFF_MS      = 30UL;    // ms con luz apagada
 // o si hay ruido en el bus UART. El watchdog verifica el chip cada NFC_CHECK_INTERVALO ms;
 // si no responde, reinicializa el puerto UART2 y el chip automaticamente.
 unsigned long nfcUltimoCheck = 0;
-const unsigned long NFC_CHECK_INTERVALO = 15000UL;  // verificar salud cada 15 s
+const unsigned long NFC_CHECK_INTERVALO = 5000UL;   // verificar salud cada 5 s
 
 // ── LED RGB: maquina de estados no bloqueante ─────────────────────────────────
 // Estados:
@@ -1500,19 +1500,39 @@ void handleSyncNtp() {
     "<a href='/config'><button>Volver</button></a></div>"));
 }
 
-// ── NFC watchdog: recuperacion UART y reinicio del PN532 ─────────────────────
-// Reinicializa el puerto UART2 y el chip PN532 sin tocar Wire ni el LCD.
+// ── NFC watchdog: recuperacion UART robusta con reintentos y auto-restart ────
+// Secuencia: flush → end/begin UART → preamble → flush → hasta 3 intentos getFirmwareVersion.
+// Tras 5 fallos consecutivos (~25s sin recuperacion), reinicia el ESP32 automaticamente.
 void nfcReinicializar() {
-  Serial.println("NFC WDG: reinicializando UART2 y PN532...");
+  static uint8_t fallosConsec = 0;
+  fallosConsec++;
+  Serial.printf("NFC WDG: recuperacion #%u — reinicializando UART2...\n", fallosConsec);
 
+  // Paso 1: cerrar completamente el UART para limpiar el estado del driver ESP32
   Serial2.end();
-  delay(200);
-  Serial2.begin(115200, SERIAL_8N1, 16, 17);
-  lectorNfc.begin();  // reinicia el canal UART interno de la libreria
-  delay(100);
+  delay(300);
 
-  uint32_t v = lectorNfc.getFirmwareVersion();
+  // Paso 2: reiniciar con pines explícitos y vaciar el buffer de recepcion
+  Serial2.begin(115200, SERIAL_8N1, 16, 17);
+  delay(100);
+  while (Serial2.available()) Serial2.read();
+
+  // Paso 3: preamble puro (sin SAMConfig embebido) para restablecer sincronismo UART del PN532
+  const uint8_t preamble[] = {0x55, 0x55, 0x55, 0x55, 0x55, 0x55};
+  Serial2.write(preamble, sizeof(preamble));
+  delay(100);
+  while (Serial2.available()) Serial2.read();
+
+  // Paso 4: hasta 3 intentos de comunicacion con flush y espera creciente entre cada uno
+  uint32_t v = 0;
+  for (int i = 0; i < 3 && !v; i++) {
+    if (i > 0) { delay(300 * i); while (Serial2.available()) Serial2.read(); }
+    v = lectorNfc.getFirmwareVersion();
+    if (!v) while (Serial2.available()) Serial2.read();  // limpiar respuesta fallida
+  }
+
   if (v) {
+    fallosConsec = 0;
     lectorNfc.SAMConfig();
     Serial.println("NFC WDG: PN532 OK, Fw v" + String((v >> 16) & 0xFF));
     if (!tiempoLcdHasta) {
@@ -1522,9 +1542,14 @@ void nfcReinicializar() {
       lcdIdleDesde = millis(); lcdParpadeoNext = 0;
     }
   } else {
-    Serial.println("NFC WDG: PN532 no responde tras reinicio");
+    Serial.printf("NFC WDG: PN532 sin respuesta (fallo consecutivo #%u)\n", fallosConsec);
     lcdWakeUp();
-    lcdMostrar("NFC ERROR", "Revisar lector", "", "");
+    lcdMostrar("NFC ERROR", "Reiniciando...", "", "");
+    if (fallosConsec >= 5) {
+      Serial.println("NFC WDG: demasiados fallos, reiniciando ESP32 automaticamente...");
+      delay(1500);
+      ESP.restart();
+    }
   }
   nfcUltimoCheck = millis();
 }
@@ -1547,7 +1572,8 @@ bool leerUidUnaVez(String &uidSalida) {
   unsigned long dt = millis() - t0;
   if (dt > 200) {
     Serial.printf("NFC: lectura lenta (%lums) — posible problema UART\n", dt);
-    nfcUltimoCheck = 0;
+    while (Serial2.available()) Serial2.read();  // vaciar bytes corruptos del buffer
+    nfcUltimoCheck = 0;  // disparar watchdog en el proximo ciclo
   }
 
   if (!hayTarjeta) {
@@ -1701,16 +1727,19 @@ void loop() {
     autoEnviarEmail(); // 2: enviar email (incluye las Salidas Pendientes recien marcadas)
   }
 
-  // Watchdog PN532: verificar salud del chip cada NFC_CHECK_INTERVALO ms.
-  // getFirmwareVersion() retorna 0 si el chip no responde (bus bloqueado o chip colgado).
-  // Con Wire.setTimeOut(200) esta llamada tarda como maximo 200 ms si el chip no responde.
+  // Watchdog PN532: verificar salud cada NFC_CHECK_INTERVALO ms.
+  // Flush antes del chequeo para no leer bytes residuales de comandos anteriores.
+  // Flush despues del chequeo exitoso para limpiar la respuesta del getFirmwareVersion.
   if (ahora - nfcUltimoCheck >= NFC_CHECK_INTERVALO) {
     nfcUltimoCheck = ahora;
+    while (Serial2.available()) Serial2.read();
     if (!lectorNfc.getFirmwareVersion()) {
+      while (Serial2.available()) Serial2.read();
       Serial.println("NFC WDG: chip no responde — iniciando recuperacion automatica");
       nfcReinicializar();
-      return;  // reiniciar el loop con el estado restaurado
+      return;
     }
+    while (Serial2.available()) Serial2.read();
   }
 
   if (ahora - ultimaLecturaNfc < INTERVALO_NFC) return;
