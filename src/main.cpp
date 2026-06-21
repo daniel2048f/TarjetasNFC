@@ -205,7 +205,7 @@ CRGB          matrizLeds[MATRIZ_LEDS];
 unsigned long matrizHasta = 0;   // ms hasta cuando mostrar el patron; 0 = permanente
 
 inline int matrizIdx(int col, int fila) {
-  return (fila % 2 == 0) ? fila * 8 + col : fila * 8 + (7 - col);
+  return fila * 8 + col;  // todas las filas izq->der (sin serpentina en impares)
 }
 
 // Marco de tarjeta — sistema disponible, esperando lectura (idle)
@@ -249,7 +249,7 @@ const uint8_t PATRON_CHECK[8] = {
   0b00000000,
   0b00000001,
   0b00000011,
-  0b10000110,
+  0b00000110,
   0b11001100,
   0b01111000,
   0b00110000,
@@ -919,14 +919,17 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
       Serial.println("EMAIL-AUTO: registros borrados, contadores reseteados, lastEmail actualizado.");
     }
     ledParpadear(LED_VERDE, LED_BLINK_N);
-    matrizMostrar(PATRON_CHECK, CRGB::Green, 3000);
   } else {
     emailEstado = "Error envio: " + smtp.errorReason();
     Serial.println("SMTP envio FALLO: " + smtp.errorReason());
     ledParpadear(LED_ROJO, LED_BLINK_N);
-    matrizMostrar(PATRON_X, CRGB::Red, 3000);
   }
   smtp.closeSession();
+  // Mostrar patron DESPUES de cerrar sesion: closeSession() puede tardar 1-5s
+  // y si se llama antes, el timer de 3s expira mientras smtp cierra y loop()
+  // muestra el patron idle en vez del check/X.
+  matrizMostrar(ok ? PATRON_CHECK : PATRON_X,
+                ok ? CRGB::Green  : CRGB::Red, 5000);
   return ok;
 }
 
