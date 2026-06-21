@@ -246,13 +246,13 @@ const uint8_t PATRON_X[8] = {
 
 // Chulito (checkmark) — exito: correo enviado, registro OK, borrado OK
 const uint8_t PATRON_CHECK[8] = {
-  0b00000001,
-  0b00000010,
-  0b00000100,
-  0b10001000,
-  0b01010000,
-  0b00100000,
   0b00000000,
+  0b00000001,
+  0b00000011,
+  0b10000110,
+  0b11001100,
+  0b01111000,
+  0b00110000,
   0b00000000,
 };
 
