@@ -6,6 +6,7 @@
 #include <LittleFS.h>
 #include <PN532_HSU.h>
 #include <PN532.h>
+#include <FastLED.h>
 #include <LiquidCrystal_I2C.h>
 #include <ESP_Mail_Client.h>
 #include <RTClib.h>
@@ -191,6 +192,87 @@ void ledSetup() {
   pinMode(LED_PIN_G, OUTPUT);
   pinMode(LED_PIN_B, OUTPUT);
   ledAplicar(LED_AMARILLO);  // estado inicial: espera normal
+}
+
+// ── Matriz WS2812B 8×8 ───────────────────────────────────────────────────────
+// 64 LEDs en topologia serpentina. Pin de datos: GPIO23.
+// Filas pares  (0,2,4,6): izq→der.  Filas impares (1,3,5,7): der→izq.
+#define MATRIZ_PIN    23
+#define MATRIZ_LEDS   64
+#define MATRIZ_BRILLO 60   // 0-255; suficiente para indicadores sin calentar la matriz
+
+CRGB          matrizLeds[MATRIZ_LEDS];
+unsigned long matrizHasta = 0;   // ms hasta cuando mostrar el patron; 0 = permanente
+
+inline int matrizIdx(int col, int fila) {
+  return (fila % 2 == 0) ? fila * 8 + col : fila * 8 + (7 - col);
+}
+
+// Marco de tarjeta — sistema disponible, esperando lectura (idle)
+const uint8_t PATRON_DISPONIBLE[8] = {
+  0b00000000,
+  0b01111110,
+  0b01000010,
+  0b01011010,
+  0b01011010,
+  0b01000010,
+  0b01111110,
+  0b00000000,
+};
+
+// Flecha apuntando arriba — acceso permitido / tarjeta registrada
+const uint8_t PATRON_FLECHA_ARRIBA[8] = {
+  0b00011000,
+  0b00111100,
+  0b01111110,
+  0b11111111,
+  0b00011000,
+  0b00011000,
+  0b00011000,
+  0b00011000,
+};
+
+// X roja — acceso denegado / tarjeta no registrada / error
+const uint8_t PATRON_X[8] = {
+  0b11000011,
+  0b01100110,
+  0b00111100,
+  0b00011000,
+  0b00011000,
+  0b00111100,
+  0b01100110,
+  0b11000011,
+};
+
+// Chulito (checkmark) — exito: correo enviado, registro OK, borrado OK
+const uint8_t PATRON_CHECK[8] = {
+  0b00000001,
+  0b00000010,
+  0b00000100,
+  0b10001000,
+  0b01010000,
+  0b00100000,
+  0b00000000,
+  0b00000000,
+};
+
+void matrizMostrar(const uint8_t patron[8], CRGB color, unsigned long duracionMs = 0) {
+  for (int fila = 0; fila < 8; fila++) {
+    uint8_t bits = patron[fila];
+    for (int col = 0; col < 8; col++) {
+      matrizLeds[matrizIdx(col, fila)] = ((bits >> (7 - col)) & 1) ? color : CRGB::Black;
+    }
+  }
+  FastLED.show();
+  matrizHasta = (duracionMs > 0) ? millis() + duracionMs : 0;
+}
+
+// Llamar en loop(): revierte al patron idle cuando expira el temporizador.
+void matrizActualizar() {
+  if (matrizHasta && millis() >= matrizHasta) {
+    matrizHasta = 0;
+    matrizMostrar(PATRON_DISPONIBLE, CRGB(100, 80, 0));  // amarillo tenue = idle
+  }
 }
 
 // Cancela el modo idle y garantiza backlight encendido.
@@ -837,10 +919,12 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
       Serial.println("EMAIL-AUTO: registros borrados, contadores reseteados, lastEmail actualizado.");
     }
     ledParpadear(LED_VERDE, LED_BLINK_N);
+    matrizMostrar(PATRON_CHECK, CRGB::Green, 3000);
   } else {
     emailEstado = "Error envio: " + smtp.errorReason();
     Serial.println("SMTP envio FALLO: " + smtp.errorReason());
     ledParpadear(LED_ROJO, LED_BLINK_N);
+    matrizMostrar(PATRON_X, CRGB::Red, 3000);
   }
   smtp.closeSession();
   return ok;
@@ -1194,6 +1278,7 @@ void handleClearRegistros() {
 
   limpiarRegistros();  // borra ambos archivos y resetea contadores NVS
   ledParpadear(LED_VERDE, LED_BLINK_N);
+  matrizMostrar(PATRON_CHECK, CRGB::Green, 3000);
 
   servidor.send(200, "text/html", pagina("Registros borrados",
     "<h2>&#10003; Todos los registros borrados</h2><div class='card'>"
@@ -1497,6 +1582,9 @@ void setup() {
   Wire.setTimeOut(200);  // limitar cada transaccion I2C a 200 ms; evita cuelgues
   lcd.init(); lcd.backlight();
   ledSetup();
+  FastLED.addLeds<WS2812B, MATRIZ_PIN, GRB>(matrizLeds, MATRIZ_LEDS);
+  FastLED.setBrightness(MATRIZ_BRILLO);
+  matrizMostrar(PATRON_DISPONIBLE, CRGB(100, 80, 0));
   lcdMostrar("Sistema NFC", "Iniciando...", "", "");
 
   // ── NVS y LittleFS ───────────────────────────────────────────────────────────
@@ -1574,6 +1662,7 @@ void loop() {
   // Proteccion LCD: titileo no bloqueante
   lcdActualizarParpadeo();
   ledActualizar();
+  matrizActualizar();
 
   // Al expirar el timer, mostrar el mensaje que corresponde al estado real actual
   if (tiempoLcdHasta && ahora >= tiempoLcdHasta) {
@@ -1640,6 +1729,7 @@ void loop() {
       lcdMostrar("No registrado", "", "", "");
       tiempoLcdHasta = millis() + 3000; lcdPost = LCD_IDLE;
       ledFijar(LED_ROJO, 3000);
+      matrizMostrar(PATRON_X, CRGB::Red, 3000);
     } else {
       String claveCode = "k" + uid;
       String codigo    = almacen.getString(claveCode.c_str(), "");
@@ -1653,6 +1743,7 @@ void loop() {
       lcdMostrarNombre(nombre, codigo);
       tiempoLcdHasta = millis() + 3000; lcdPost = LCD_LISTO;
       ledFijar(LED_VERDE, 3000);
+      matrizMostrar(PATRON_CHECK, CRGB::Green, 3000);
     }
     resultadoEliminacion = true; modoEliminar = false; return;
   }
@@ -1670,6 +1761,7 @@ void loop() {
     lcdMostrarNombre(nombrePendiente, codigoPendiente);
     tiempoLcdHasta = millis() + 4000; lcdPost = LCD_LISTO;
     ledFijar(LED_VERDE, 4000);
+    matrizMostrar(PATRON_CHECK, CRGB::Green, 4000);
     esperandoTarjeta = false; codigoPendiente = ""; nombrePendiente = ""; return;
   }
 
@@ -1714,4 +1806,6 @@ void loop() {
   lcdMostrarNombre(nombre, codigo);
   tiempoLcdHasta = millis() + 4000; lcdPost = LCD_IDLE;
   ledFijar(nombre != "NO_REGISTRADO" ? LED_VERDE : LED_ROJO, 4000);
+  matrizMostrar(nombre != "NO_REGISTRADO" ? PATRON_FLECHA_ARRIBA : PATRON_X,
+                nombre != "NO_REGISTRADO" ? CRGB::Green : CRGB::Red, 4000);
 }
