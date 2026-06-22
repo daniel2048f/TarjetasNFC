@@ -830,7 +830,16 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
   String fechaUsr = fechaHoy; fechaUsr.replace("-", "_");
   String nomUsr   = "usuarios_" + fechaUsr + ".csv";
 
-  String asunto = "Registros NFC - " + fechaHoy;
+  // Contador de correos del dia (se resetea diariamente)
+  int contadorEmail = 1;
+  if (almacen.getString("emailCntDate", "") == fechaHoy)
+    contadorEmail = almacen.getInt("emailCnt", 0) + 1;
+  String sufijoContador = " - " + String(contadorEmail);
+  if (nomLog.endsWith(".csv")) nomLog = nomLog.substring(0, nomLog.length()-4) + sufijoContador + ".csv";
+  if (nomEnt.endsWith(".csv")) nomEnt = nomEnt.substring(0, nomEnt.length()-4) + sufijoContador + ".csv";
+  if (nomUsr.endsWith(".csv")) nomUsr = nomUsr.substring(0, nomUsr.length()-4) + sufijoContador + ".csv";
+
+  String asunto = "Registros NFC - " + fechaHoy + " - " + String(contadorEmail);
   String cuerpo = "Reporte " + String(borrarTras ? "automatico" : "manual")
                   + " del sistema NFC.\nFecha: " + fechaHoy + "\n\nAdjuntos:\n"
                   "  - " + nomLog + "\n"
@@ -902,6 +911,8 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
   if (ok) {
     emailEstado   = "Enviado OK - " + (rtcDisponible ? obtenerTimestamp() : fechaHoy);
     emailUltimoTs = emailEstado.substring(emailEstado.indexOf('-') + 2);
+    almacen.putString("emailCntDate", fechaHoy);
+    almacen.putInt("emailCnt", contadorEmail);
     Serial.println("SMTP: envio EXITOSO");
     if (borrarTras) {
       limpiarRegistros();  // borra ambos archivos y resetea contadores NVS
