@@ -435,12 +435,16 @@ const char ESTILOS[] =
   ".btn-ok{background:#28a745;color:white;font-weight:bold}"
   ".btn-email{background:#0066cc;color:white;font-weight:bold}"
   ".entrada{color:#28a745;font-weight:bold}.salida{color:#dc3545;font-weight:bold}"
-  ".pendiente{color:#ff9800;font-weight:bold}</style>";
+  ".pendiente{color:#ff9800;font-weight:bold}"
+  ".btn-home{background:#555;color:white;border:none;border-radius:20px;"
+  "padding:6px 13px;font-size:14px;cursor:pointer;opacity:0.88}</style>";
 
 String pagina(const String& titulo, const String& cuerpo) {
   return "<!doctype html><html><head><meta charset='utf-8'>"
          "<meta name='viewport' content='width=device-width,initial-scale=1'>"
          "<title>" + titulo + "</title>" + ESTILOS + "</head><body>"
+         "<a href='/' style='position:fixed;top:12px;right:12px;z-index:999;text-decoration:none'>"
+         "<button class='btn-home'>&#127968; Inicio</button></a>"
          + bannerAlerta() + cuerpo + "</body></html>";
 }
 
@@ -462,15 +466,30 @@ bool logParsear(const String& entrada, String &ts, String &uid, String &nombre, 
   return true;
 }
 
+// Mensaje de error de memoria reutilizable en logHtml / entradaHtml.
+static String errorMemoria(const char* descarga, const char* prefijo) {
+  return String("<div class='card' style='border-color:#dc3545'>"
+         "<p><b>&#9888; Memoria insuficiente para mostrar los registros.</b></p>"
+         "<p class='muted'>Descargue el CSV y luego borre los registros para liberar espacio.</p>"
+         "<a href='") + descarga + "'><button class='btn-ok'>&#128229; Descargar CSV</button></a> "
+         "<a href='/clearRegistros' onclick='return confirm(\"Borrar TODOS los registros?\")'>"
+         "<button class='btn-danger'>&#128465; Borrar registros</button></a></div>";
+}
+
 String logHtml() {
   File f = LittleFS.open(ARCHIVO_LOG, "r");
   if (!f || !f.size())
     return "<div class='card'><div class='muted'>No hay eventos registrados.</div></div>";
+  if (ESP.getFreeHeap() < 45000) {
+    f.close();
+    return errorMemoria("/downloadLogs", "accesos");
+  }
   int total = 0;
   while (f.available()) { if (f.read() == '\n') total++; }
   f.seek(0);
   int mostrar = min(total, 300), saltar = total - mostrar;
   String* buf = new String[mostrar];
+  if (!buf) { f.close(); return errorMemoria("/downloadLogs", "accesos"); }
   int n = 0, fila = 0;
   while (f.available()) {
     String l = f.readStringUntil('\n'); l.trim();
@@ -533,11 +552,16 @@ String entradaHtml() {
   File f = LittleFS.open(ARCHIVO_ENT, "r");
   if (!f || !f.size())
     return "<div class='card'><div class='muted'>No hay registros de entradas/salidas.</div></div>";
+  if (ESP.getFreeHeap() < 45000) {
+    f.close();
+    return errorMemoria("/downloadEntradas", "entradas");
+  }
   int total = 0;
   while (f.available()) { if (f.read() == '\n') total++; }
   f.seek(0);
   int mostrar = min(total, 300), saltar = total - mostrar;
   String* buf = new String[mostrar];
+  if (!buf) { f.close(); return errorMemoria("/downloadEntradas", "entradas"); }
   int n = 0, fila = 0;
   while (f.available()) {
     String l = f.readStringUntil('\n'); l.trim();
