@@ -44,7 +44,7 @@ PN532             lectorNfc(pn532hsu);
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
 const char* SSID_AP  = "NFC";
-const char* CLAVE_AP = "12345678";
+const char* CLAVE_AP = "1234567890";
 WebServer   servidor(80);
 Preferences almacen;
 SMTPSession smtp; 
