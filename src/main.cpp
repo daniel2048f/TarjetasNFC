@@ -1292,9 +1292,64 @@ void handleDeleted() {
   servidor.send(200, "text/html", pagina("Usuario borrado", cuerpo));
 }
 
+// Envia la cabecera HTML via sendContent para respuestas en streaming.
+// Evita construir un String gigante en RAM combinando header+cuerpo+footer.
+void sendPaginaHeader(const String& titulo) {
+  servidor.sendContent("<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>" + titulo + "</title>");
+  servidor.sendContent(ESTILOS, sizeof(ESTILOS) - 1);
+  servidor.sendContent("</head><body>"
+    "<a href='/' style='position:fixed;top:12px;right:12px;z-index:999;text-decoration:none'>"
+    "<button class='btn-home'>&#127968; Inicio</button></a>");
+  String banner = bannerAlerta();
+  if (banner.length()) servidor.sendContent(banner);
+}
+
 void handleLogs() {
-  servidor.send(200, "text/html", pagina("Logs",
-    "<h2>Logs de acceso</h2>" + logHtml() +
+  servidor.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  servidor.send(200, "text/html", "");
+  sendPaginaHeader("Logs");
+  servidor.sendContent("<h2>Logs de acceso</h2>");
+
+  File f = LittleFS.open(ARCHIVO_LOG, "r");
+  if (!f || !f.size()) {
+    servidor.sendContent("<div class='card'><div class='muted'>No hay eventos registrados.</div></div>");
+  } else {
+    int total = 0;
+    while (f.available()) { if (f.read() == '\n') total++; }
+    f.seek(0);
+    int mostrar = min(total, 300), saltar = total - mostrar;
+    String* buf = new String[mostrar];
+    if (!buf) {
+      f.close();
+      servidor.sendContent(errorMemoria("/downloadLogs", "accesos"));
+    } else {
+      int n = 0, fila = 0;
+      while (f.available()) {
+        String l = f.readStringUntil('\n'); l.trim();
+        if (!l.length()) continue;
+        if (fila++ < saltar) continue;
+        buf[n++] = l;
+      }
+      f.close();
+      servidor.sendContent("<div class='card'><div class='muted'>Total: " + String(total)
+        + " eventos" + (total > 300 ? " (mostrando los ultimos 300)" : "") + "</div><hr>");
+      for (int i = n - 1; i >= 0; i--) {
+        String ts, uid, nombre, codigo;
+        if (!logParsear(buf[i], ts, uid, nombre, codigo)) continue;
+        String row = "<div><b>" + nombre + "</b>";
+        if (codigo.length()) row += " <span class='muted'>[" + codigo + "]</span>";
+        row += " <span class='muted'>(UID: " + uid + ")</span><br>"
+               "<span class='ts'>&#128336; " + ts + "</span></div><hr>";
+        servidor.sendContent(row);
+      }
+      delete[] buf;
+      servidor.sendContent("</div>");
+    }
+  }
+
+  servidor.sendContent(
     "<div style='margin:20px 0;display:flex;flex-wrap:wrap;gap:8px'>"
     "<a href='/'><button>Volver</button></a> "
     "<a href='/downloadLogs'><button class='btn-ok'>&#128229; Descargar CSV</button></a> "
@@ -1303,7 +1358,9 @@ void handleLogs() {
     "<a href='/clearRegistros' onclick='return confirm(\"Borrar TODOS los registros?\\n"
     "Se eliminaran logs de acceso, entradas/salidas y se resetearan los contadores de tarjetas.\\n"
     "Las tarjetas registradas NO se eliminaran.\");'>"
-    "<button class='btn-danger'>&#128465; Borrar todos los registros</button></a></div>"));
+    "<button class='btn-danger'>&#128465; Borrar todos los registros</button></a></div>"
+    "</body></html>");
+  servidor.sendContent("");
 }
 
 void handleClearRegistros() {
@@ -1349,15 +1406,90 @@ void handleCancelar() {
 }
 
 void handleEntradas() {
-  servidor.send(200, "text/html", pagina("Entradas/Salidas",
-    "<h2>Registros de Entradas/Salidas</h2>" + entradaHtml() +
+  servidor.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  servidor.send(200, "text/html", "");
+  sendPaginaHeader("Entradas/Salidas");
+  servidor.sendContent("<h2>Registros de Entradas/Salidas</h2>");
+
+  File f = LittleFS.open(ARCHIVO_ENT, "r");
+  if (!f || !f.size()) {
+    servidor.sendContent("<div class='card'><div class='muted'>No hay registros de entradas/salidas.</div></div>");
+  } else {
+    int total = 0;
+    while (f.available()) { if (f.read() == '\n') total++; }
+    f.seek(0);
+    int mostrar = min(total, 300), saltar = total - mostrar;
+    String* buf = new String[mostrar];
+    if (!buf) {
+      f.close();
+      servidor.sendContent(errorMemoria("/downloadEntradas", "entradas"));
+    } else {
+      int n = 0, fila = 0;
+      while (f.available()) {
+        String l = f.readStringUntil('\n'); l.trim();
+        if (!l.length()) continue;
+        if (fila++ < saltar) continue;
+        buf[n++] = l;
+      }
+      f.close();
+      servidor.sendContent("<div class='card'><div class='muted'>Total: " + String(total)
+        + " registros" + (total > 300 ? " (mostrando los ultimos 300)" : "") + "</div><hr>");
+
+      const int MAX_UIDS = 100;
+      String uids[MAX_UIDS]; int nu = 0;
+      for (int i = 0; i < n && nu < MAX_UIDS; i++) {
+        String ts, uid, nombre, codigo, tipo;
+        if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
+        bool existe = false;
+        for (int j = 0; j < nu; j++) { if (uids[j] == uid) { existe = true; break; } }
+        if (!existe) uids[nu++] = uid;
+      }
+
+      for (int u = 0; u < nu; u++) {
+        String nombreGrupo = uids[u];
+        for (int i = 0; i < n; i++) {
+          String ts, uid, nombre, codigo, tipo;
+          if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
+          if (uid == uids[u]) { nombreGrupo = nombre; break; }
+        }
+        servidor.sendContent("<div class='card' style='margin:6px 0'>"
+          "<b>" + nombreGrupo + "</b> <span class='muted'>(UID: " + uids[u] + ")</span>");
+        for (int i = 0; i < n; i++) {
+          String ts, uid, nombre, codigo, tipo;
+          if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
+          if (uid != uids[u]) continue;
+          String row;
+          if (tipo == "Salida: Pendiente") {
+            row = "<div style='padding:3px 0 3px 8px'>"
+                  "<span class='pendiente'>&#x25cf; Salida: Pendiente</span>"
+                  " <span class='muted'>(sin registro de salida)</span>";
+          } else {
+            String cls = (tipo == "Entrada") ? "entrada" : "salida";
+            row = "<div style='padding:3px 0 3px 8px'>"
+                  "<span class='" + cls + "'>&#x25cf; " + tipo + "</span>"
+                  " <span class='ts'>&#128336; " + ts + "</span>";
+          }
+          if (codigo.length()) row += " <span class='muted'>[" + codigo + "]</span>";
+          row += "</div>";
+          servidor.sendContent(row);
+        }
+        servidor.sendContent("</div>");
+      }
+      delete[] buf;
+      servidor.sendContent("</div>");
+    }
+  }
+
+  servidor.sendContent(
     "<div style='margin:20px 0;display:flex;flex-wrap:wrap;gap:8px'>"
     "<a href='/'><button>Volver</button></a> "
     "<a href='/downloadEntradas'><button class='btn-ok'>&#128229; Descargar CSV</button></a> "
     "<a href='/clearRegistros' onclick='return confirm(\"Borrar TODOS los registros?\\n"
     "Se eliminaran logs de acceso, entradas/salidas y se resetearan los contadores de tarjetas.\\n"
     "Las tarjetas registradas NO se eliminaran.\");'>"
-    "<button class='btn-danger'>&#128465; Borrar todos los registros</button></a></div>"));
+    "<button class='btn-danger'>&#128465; Borrar todos los registros</button></a></div>"
+    "</body></html>");
+  servidor.sendContent("");
 }
 
 void handleDownloadEntradas() {
