@@ -91,7 +91,7 @@ LcdPost lcdPost = LCD_IDLE;
 bool          lcdBacklightOn  = true;
 unsigned long lcdIdleDesde    = 0;     // millis() al entrar en idle; 0 = no idle
 unsigned long lcdParpadeoNext = 0;     // proxima inversion del backlight
-const unsigned long LCD_IDLE_BLINK_INICIO = 5000UL; // 5 seg idle antes de titular
+const unsigned long LCD_IDLE_BLINK_INICIO = 1000UL; // 5 seg idle antes de titular
 const unsigned long LCD_BLINK_ON_MS       = 100UL;   // ms con luz encendida
 const unsigned long LCD_BLINK_OFF_MS      = 30UL;    // ms con luz apagada
 
@@ -295,9 +295,11 @@ void lcdActualizarParpadeo() {
   if (ahora >= lcdParpadeoNext) {
     if (lcdBacklightOn) {
       lcd.noBacklight(); lcdBacklightOn = false;
+      fill_solid(matrizLeds, MATRIZ_LEDS, CRGB::Black); FastLED.show();
       lcdParpadeoNext = ahora + LCD_BLINK_OFF_MS;
     } else {
       lcd.backlight();   lcdBacklightOn = true;
+      matrizMostrar(PATRON_DISPONIBLE, CRGB(100, 80, 0));
       lcdParpadeoNext = ahora + LCD_BLINK_ON_MS;
     }
   }
@@ -839,9 +841,10 @@ String nombreAdjunto(const char* rutaArchivo, const char* prefijo) {
 }
 
 // Envia logs, entradas y lista de usuarios como adjuntos al email configurado.
-// borrarTras=true  → envio automatico: borra archivos y actualiza lastEmail.
-// borrarTras=false → envio manual:    archivos intactos, lastEmail sin cambios.
-bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTras) {
+// automatico=true actualiza lastEmail; borrarTras solo limpia en fechas programadas.
+// El envio manual conserva los archivos y no modifica lastEmail.
+bool enviarEmail(const String& csvLog, const String& csvEntradas,
+                 bool borrarTras, bool automatico = false) {
   String destino = almacen.getString("emailDest", "");
   if (!destino.length()) { emailEstado = "Sin destinatario configurado"; return false; }
   if (WiFi.status() != WL_CONNECTED) { emailEstado = "Sin conexion WiFi"; return false; }
@@ -864,7 +867,7 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
   if (nomUsr.endsWith(".csv")) nomUsr = nomUsr.substring(0, nomUsr.length()-4) + sufijoContador + ".csv";
 
   String asunto = "Registros NFC - " + fechaHoy + " - " + String(contadorEmail);
-  String cuerpo = "Reporte " + String(borrarTras ? "automatico" : "manual")
+  String cuerpo = "Reporte " + String(automatico ? "automatico" : "manual")
                   + " del sistema NFC.\nFecha: " + fechaHoy + "\n\nAdjuntos:\n"
                   "  - " + nomLog + "\n"
                   "  - " + nomEnt + "\n"
@@ -938,8 +941,7 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
     almacen.putString("emailCntDate", fechaHoy);
     almacen.putInt("emailCnt", contadorEmail);
     Serial.println("SMTP: envio EXITOSO");
-    if (borrarTras) {
-      limpiarRegistros();  // borra ambos archivos y resetea contadores NVS
+    if (automatico) {
       // Actualizar lastEmail para evitar reenvio automatico el mismo dia
       if (rtcDisponible) {
         FechaHora fh = rtcLeerFechaHora();
@@ -951,7 +953,11 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas, bool borrarTra
         emailPendienteFlag = false;
         almacen.putBool("emailPend", false);
       }
-      Serial.println("EMAIL-AUTO: registros borrados, contadores reseteados, lastEmail actualizado.");
+      if (borrarTras) {
+        limpiarRegistros();  // solo dias 10, 20 y ultimo del mes
+        Serial.println("EMAIL-AUTO: registros borrados y contadores reseteados.");
+      }
+      Serial.println("EMAIL-AUTO: lastEmail actualizado.");
     }
     ledParpadear(LED_VERDE, LED_BLINK_N);
   } else {
@@ -1071,31 +1077,18 @@ void cerrarDia() {
   Serial.printf("CIERRE-DIA: completado, %d UIDs procesados\n", nu);
 }
 
-// Retorna la fecha "YYYY-MM-DD" del dia de envio mas reciente que ya ha pasado
-// (estrictamente anterior al dia actual). Si hoy mismo es un dia de envio, ese dia
-// solo se considera "pasado" si hora > 12 (ambas ventanas agotadas).
-// Considera dias de envio: 10, 20 y ultimo dia del mes.
+// Retorna la fecha "YYYY-MM-DD" del dia anterior para detectar envios diarios perdidos.
 String calcularUltimoEnvioPasado(int anio, int mes, int dia, int ud) {
-  int candidatos[] = {10, 20, ud};
-  // Buscar el mayor dia de envio en el mes actual que sea < dia
-  int mejorDia = -1;
-  for (int i = 0; i < 3; i++) {
-    if (candidatos[i] < dia && candidatos[i] > mejorDia) mejorDia = candidatos[i];
+  (void)ud;
+  dia--;
+  if (dia == 0) {
+    mes--;
+    if (mes == 0) { mes = 12; anio--; }
+    if (anio < 2020) return "";
+    dia = ultimoDiaDelMes(mes, anio);
   }
   char buf[11];
-  if (mejorDia > 0) {
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", anio, mes, mejorDia);
-    return String(buf);
-  }
-  // Sin candidatos este mes → buscar en el mes anterior
-  int mesPrev = mes - 1, anioPrev = anio;
-  if (mesPrev == 0) { mesPrev = 12; anioPrev--; }
-  if (anioPrev < 2020) return "";
-  int udPrev = ultimoDiaDelMes(mesPrev, anioPrev);
-  int diasPrev[] = {10, 20, udPrev};
-  mejorDia = -1;
-  for (int i = 0; i < 3; i++) if (diasPrev[i] > mejorDia) mejorDia = diasPrev[i];
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02d", anioPrev, mesPrev, mejorDia);
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d", anio, mes, dia);
   return String(buf);
 }
 
@@ -1109,14 +1102,12 @@ void autoEnviarEmail() {
   FechaHora fh = rtcLeerFechaHora();
   int ud = ultimoDiaDelMes(fh.mes, fh.anio);
   char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
-  bool esDiaEnvio = (fh.dia == 10 || fh.dia == 20 || fh.dia == ud);
+  bool esDiaLimpieza = (fh.dia == 10 || fh.dia == 20 || fh.dia == ud);
   String lastEmail = almacen.getString("lastEmail", "");
 
   // ── Deteccion de envio perdido en dias anteriores ─────────────
-  // Solo cuando ya hubo un envio previo (lastEmail no vacio) y las ventanas del dia
-  // de envio actual aun estan abiertas no se evalua (hora <= 12 en dia de envio).
-  // Evita activar la bandera mientras el dia de envio actual todavia puede completarse.
-  if (!emailPendienteFlag && lastEmail.length() > 0 && !(esDiaEnvio && fh.hora <= 12)) {
+  // Solo cuando ya hubo un envio previo y las dos ventanas de hoy se agotaron.
+  if (!emailPendienteFlag && lastEmail.length() > 0 && fh.hora > 12) {
     String ultimoPasado = calcularUltimoEnvioPasado(fh.anio, fh.mes, fh.dia, ud);
     if (ultimoPasado.length() && lastEmail < ultimoPasado) {
       // Solo activar si hay datos que proteger (logs no vacios)
@@ -1132,13 +1123,12 @@ void autoEnviarEmail() {
   }
 
   // ── Intentar envio en dias y ventanas programadas ─────────────
-  if (!esDiaEnvio) return;
   if (lastEmail == String(hoy)) return;  // ya enviado hoy
 
   if (fh.hora == 0 || fh.hora == 12) {
     if (WiFi.status() != WL_CONNECTED) return;
     Serial.printf("AUTO-EMAIL: ventana hora %d, generando CSV...\n", fh.hora);
-    bool ok = enviarEmail(logCsv(), entradaCsv(), true);
+    bool ok = enviarEmail(logCsv(), entradaCsv(), esDiaLimpieza, true);
     Serial.println(ok ? "AUTO-EMAIL enviado: " + String(hoy)
                       : "AUTO-EMAIL: fallo en ventana hora " + String(fh.hora));
   } else if (fh.hora > 12) {
@@ -1554,8 +1544,9 @@ void handleConfig() {
     "<input type='number' name='ntpOffsetH' min='-12' max='14' value='" + offsetHStr + "'><br><br>"
     "<button type='submit'>&#10003; Guardar y reconectar</button></form>"
     "<p class='muted'>Ultimo envio automatico de correo: " + ultimoEmail + "</p>"
-    "<p class='muted'>Reportes automaticos los dias 10, 20 y ultimo del mes a medianoche "
-    "(reintento al mediodia si falla). Si ambos fallan, aparece alerta en la web.</p>"
+    "<p class='muted'>Reportes automaticos diarios a medianoche "
+    "(reintento al mediodia si falla). La memoria se borra solo los dias 10, 20 y ultimo "
+    "del mes, despues de verificar el envio. Si ambos intentos fallan, aparece alerta en la web.</p>"
     "</div>"
 
     "<div class='card'><h3>&#128336; Sincronizacion NTP</h3>"
