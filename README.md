@@ -12,40 +12,53 @@ Sistema embebido de control de acceso basado en tarjetas NFC. Lee UIDs de tarjet
 4. [Configuración inicial](#configuración-inicial)
 5. [Interfaz web](#interfaz-web)
 6. [Indicadores LED RGB](#indicadores-led-rgb)
-7. [Mensajes de la LCD](#mensajes-de-la-lcd)
-8. [Comportamiento ante cortes de alimentación](#comportamiento-ante-cortes-de-alimentación)
-9. [Sistema de correo automático](#sistema-de-correo-automático)
-10. [Solución de problemas](#solución-de-problemas)
+7. [Indicadores de la matriz LED](#indicadores-de-la-matriz-led)
+8. [Mensajes de la LCD](#mensajes-de-la-lcd)
+9. [Comportamiento ante cortes de alimentación](#comportamiento-ante-cortes-de-alimentación)
+10. [Sistema de correo automático](#sistema-de-correo-automático)
+11. [Solución de problemas](#solución-de-problemas)
 
 ---
 
 ## Componentes de hardware
 
-| Componente           | Referencia / Descripción                                     |
-| -------------------- | ------------------------------------------------------------ |
-| Microcontrolador     | ESP32 DevKit v1 (o compatible, 38 pines)                     |
-| Lector NFC           | Adafruit PN532 NFC/RFID Controller (I2C)                     |
-| Reloj en tiempo real | DS3231 RTC Module (con batería CR2032)                       |
-| Pantalla             | LCD 20×4 caracteres con módulo I2C PCF8574 (dirección 0x27)  |
-| LED indicador        | LED RGB de 4 pines, ánodo común o cátodo común               |
-| Tarjetas             | Tarjetas o llaveros Mifare ISO14443A (compatibles con PN532) |
+| Componente           | Referencia / Descripción                                          |
+| -------------------- | ------------------------------------------------------------------ |
+| Microcontrolador     | ESP32 DevKit v1 (o compatible, 38 pines)                           |
+| Lector NFC           | PN532 NFC/RFID Controller, en modo **HSU (UART serial)**           |
+| Reloj en tiempo real | DS3231 RTC Module (con batería CR2032), vía librería RTClib        |
+| Pantalla             | LCD 20×4 caracteres con módulo I2C PCF8574 (dirección 0x27)        |
+| LED indicador        | LED RGB de 4 pines, ánodo común o cátodo común                     |
+| Matriz de LEDs       | Matriz WS2812B 8×8 (64 LEDs direccionables), vía librería FastLED  |
+| Tarjetas             | Tarjetas o llaveros Mifare ISO14443A (compatibles con PN532)       |
 
-> El PN532 debe configurarse en modo **I2C** (puentes de selección de protocolo en posición I2C antes de instalarlo).
+> El PN532 debe configurarse en modo **HSU / UART** (puentes o resistencias de selección de protocolo del módulo en la posición de comunicación serial, **no** I2C ni SPI — consultar el datasheet del módulo específico). El firmware se compila con el flag `-DNFC_INTERFACE_HSU` (ver [platformio.ini](platformio.ini)) y usa la librería [PN532 de Seeed-Studio](https://github.com/Seeed-Studio/PN532), no la de Adafruit.
 
 ---
 
 ## Conexiones físicas
 
-### Bus I2C 0 — Wire (pines 21/22): PN532 + LCD
+### UART2 (pines 16/17): PN532 en modo HSU
 
-| Señal | ESP32 GPIO | PN532       | LCD (PCF8574)                  |
-| ----- | ---------- | ----------- | ------------------------------ |
-| SDA   | 21         | SDA         | SDA                            |
-| SCL   | 22         | SCL         | SCL                            |
-| VCC   | 3.3 V      | VCC (3.3 V) | VCC (5 V o 3.3 V según módulo) |
-| GND   | GND        | GND         | GND                            |
+| Señal | ESP32 GPIO | PN532        |
+| ----- | ---------- | ------------ |
+| RX2   | 16         | TX (salida)  |
+| TX2   | 17         | RX (entrada) |
+| VCC   | 3.3 V      | VCC (3.3 V)  |
+| GND   | GND        | GND          |
 
-> Ambos dispositivos comparten el mismo bus I2C. El PN532 tiene dirección I2C 0x48 (por defecto en modo I2C) y el módulo LCD tiene dirección 0x27.
+> El PN532 se comunica por **UART serial (HSU)**, no por I2C. Usa el controlador `Serial2` del ESP32 a través de la librería `PN532_HSU` (Seeed-Studio) y no comparte bus con ningún otro periférico del sistema. No requiere pines IRQ ni RESET físicos.
+
+### Bus I2C 0 — Wire (pines 21/22): LCD
+
+| Señal | ESP32 GPIO | LCD (PCF8574)                  |
+| ----- | ---------- | ------------------------------- |
+| SDA   | 21         | SDA                             |
+| SCL   | 22         | SCL                             |
+| VCC   | 3.3 V      | VCC (5 V o 3.3 V según módulo)  |
+| GND   | GND        | GND                             |
+
+> Este bus está dedicado exclusivamente a la LCD (dirección I2C 0x27). El PN532 ya no lo comparte, por lo que no existe riesgo de bloqueo del bus por interferencia entre ambos dispositivos.
 
 ### Bus I2C 1 — busRtc (pines 19/18): DS3231
 
@@ -56,31 +69,41 @@ Sistema embebido de control de acceso basado en tarjetas NFC. Lee UIDs de tarjet
 | VCC   | 3.3 V      | VCC    |
 | GND   | GND        | GND    |
 
-> El DS3231 usa un bus I2C independiente para evitar interferencias con el PN532 y la LCD.
+> El DS3231 usa un tercer bus I2C independiente (segundo controlador I2C del ESP32) para evitar cualquier interferencia con la LCD.
 
 ### LED RGB (pines 25/26/27)
 
-El tipo de LED (ánodo o cátodo común) se configura con la constante `LED_ANODO_COMUN` en `src/main.cpp`. El valor por defecto es `true` (ánodo común).
+El tipo de LED (ánodo o cátodo común) se configura con la constante `LED_ANODO_COMUN` en `src/main.cpp`. El valor por defecto actual es `false` (**cátodo común**).
 
-**Ánodo común** (`LED_ANODO_COMUN true`, configuración por defecto):
-
-| Pin LED           | Conexión                | ESP32 GPIO |
-| ----------------- | ----------------------- | ---------- |
-| Ánodo común (VCC) | 3.3 V                   | —          |
-| R (rojo)          | Resistencia 100–220 Ω → | GPIO 25    |
-| G (verde)         | Resistencia 100–220 Ω → | GPIO 26    |
-| B (azul)          | Resistencia 100–220 Ω → | GPIO 27    |
-
-**Cátodo común** (`LED_ANODO_COMUN false`):
+**Cátodo común** (`LED_ANODO_COMUN false`, configuración por defecto):
 
 | Pin LED            | Conexión                | ESP32 GPIO |
-| ------------------ | ----------------------- | ---------- |
-| Cátodo común (GND) | GND                     | —          |
-| R (rojo)           | Resistencia 100–220 Ω → | GPIO 25    |
-| G (verde)          | Resistencia 100–220 Ω → | GPIO 26    |
-| B (azul)           | Resistencia 100–220 Ω → | GPIO 27    |
+| ------------------- | ------------------------ | ---------- |
+| Cátodo común (GND) | GND                      | —          |
+| R (rojo)            | Resistencia 100–220 Ω → | GPIO 25    |
+| G (verde)           | Resistencia 100–220 Ω → | GPIO 26    |
+| B (azul)            | Resistencia 100–220 Ω → | GPIO 27    |
+
+**Ánodo común** (`LED_ANODO_COMUN true`):
+
+| Pin LED            | Conexión                | ESP32 GPIO |
+| ------------------- | ------------------------ | ---------- |
+| Ánodo común (VCC)  | 3.3 V                    | —          |
+| R (rojo)            | Resistencia 100–220 Ω → | GPIO 25    |
+| G (verde)           | Resistencia 100–220 Ω → | GPIO 26    |
+| B (azul)            | Resistencia 100–220 Ω → | GPIO 27    |
 
 > Los GPIOs 25, 26 y 27 son de propósito general y no están usados por ningún otro periférico del sistema.
+
+### Matriz LED WS2812B 8×8 (pin 23)
+
+| Señal      | ESP32 GPIO | Matriz WS2812B        |
+| ---------- | ---------- | ---------------------- |
+| DIN (dato) | 23         | DIN (entrada de datos) |
+| VCC        | 5 V        | VCC                     |
+| GND        | GND        | GND                     |
+
+> Los 64 LEDs se controlan por una sola línea de datos (protocolo WS2812B) mediante la librería FastLED. El brillo está limitado por firmware a 60/255 para evitar calentamiento excesivo y reducir el consumo. GPIO 23 es de propósito general y no está usado por ningún otro periférico.
 
 ---
 
@@ -94,18 +117,21 @@ El tipo de LED (ánodo o cátodo común) se configura con la constante `LED_ANOD
 
 ### Dependencias (se instalan automáticamente con PlatformIO)
 
-| Librería          | Versión | Fuente                          |
-| ----------------- | ------- | ------------------------------- |
-| Adafruit PN532    | ^1.2.4  | adafruit/Adafruit PN532         |
-| LiquidCrystal_I2C | ^1.1.4  | marcoschwartz/LiquidCrystal_I2C |
-| ESP Mail Client   | ^3.4.19 | mobizt/ESP Mail Client          |
-| RTClib            | ^2.1.4  | adafruit/RTClib                 |
+| Librería          | Versión | Fuente                                   |
+| ----------------- | ------- | ------------------------------------------ |
+| PN532             | —       | github.com/Seeed-Studio/PN532 (modo HSU) |
+| LiquidCrystal_I2C | ^1.1.4  | marcoschwartz/LiquidCrystal_I2C          |
+| ESP Mail Client   | ^3.4.19 | mobizt/ESP Mail Client                   |
+| RTClib            | ^2.1.4  | adafruit/RTClib                          |
+| FastLED           | ^3.9.0  | fastled/FastLED                          |
 
 Las siguientes librerías son parte del framework Arduino para ESP32 y **no** requieren declaración adicional:
 
 `WiFi`, `WebServer`, `Preferences`, `Wire`, `LittleFS`
 
 > El proyecto usa la partición `min_spiffs.csv` para maximizar el espacio disponible para LittleFS. Esta partición viene incluida en el framework de ESP32 para PlatformIO.
+>
+> El `build_flags = -DNFC_INTERFACE_HSU` en [platformio.ini](platformio.ini) le indica a la librería PN532 que se comunique por UART (HSU) en vez de I2C. No quitar este flag: sin él, la librería intenta hablar por I2C con el chip y la lectura de tarjetas falla.
 
 ### Pasos de instalación
 
@@ -127,7 +153,7 @@ platformio run --environment esp32dev --target monitor
 Antes de compilar, verificar en `src/main.cpp`:
 
 ```cpp
-#define LED_ANODO_COMUN true   // true = ánodo común | false = cátodo común
+#define LED_ANODO_COMUN false   // true = ánodo común | false = cátodo común (valor por defecto)
 ```
 
 ---
@@ -138,11 +164,11 @@ Antes de compilar, verificar en `src/main.cpp`:
 
 El ESP32 crea un punto de acceso WiFi propio:
 
-| Parámetro          | Valor         |
-| ------------------ | ------------- |
-| SSID               | `NFC`         |
-| Contraseña         | `12345678`    |
-| IP del dispositivo | `192.168.4.1` |
+| Parámetro          | Valor          |
+| ------------------ | -------------- |
+| SSID               | `NFC`          |
+| Contraseña         | `1234567890`   |
+| IP del dispositivo | `192.168.4.1`  |
 
 Conectarse a esta red desde cualquier dispositivo y abrir `http://192.168.4.1` en el navegador.
 
@@ -235,7 +261,22 @@ Todas las rutas son accesibles desde `http://192.168.4.1`.
 
 ### Protección de la LCD (backlight)
 
-Después de 2 minutos sin actividad, el backlight de la LCD parpadea brevemente cada 30 segundos (3 s encendido / 1 s apagado) para reducir el desgaste. Cualquier lectura de tarjeta o acción desde la web restaura el backlight inmediatamente.
+Después de 1 segundo sin actividad, el backlight de la LCD entra en un parpadeo continuo (100 ms encendido / 30 ms apagado) mientras el sistema permanece inactivo, para reducir el desgaste del panel. Durante la fase "apagado" de cada ciclo, la matriz de LEDs también se apaga momentáneamente, así ambos indicadores parpadean de forma sincronizada. Cualquier lectura de tarjeta o acción desde la web restaura el backlight y la matriz de inmediato (`lcdWakeUp()`).
+
+---
+
+## Indicadores de la matriz LED
+
+La matriz WS2812B 8×8 muestra un ícono (patrón de píxeles) según el estado del sistema, en paralelo a la LCD y al LED RGB. Cada patrón se dibuja con `matrizMostrar()` y puede ser temporal (vuelve sola al ícono de espera tras N milisegundos) o permanente hasta el siguiente evento.
+
+| Ícono                     | Color                  | Significado                                             | Duración                                |
+| -------------------------- | ----------------------- | --------------------------------------------------------- | ------------------------------------------ |
+| Marco (cuadro vacío)      | Amarillo tenue          | Sistema en espera (idle) — equivalente al LED amarillo   | Permanente hasta la próxima lectura      |
+| Flecha apuntando arriba   | Verde                   | Tarjeta registrada leída, acceso permitido                | ~4 s (igual que el mensaje en LCD)       |
+| X                         | Rojo                    | Tarjeta NO registrada, borrado fallido o error del lector | ~3–4 s según el evento                   |
+| Chulito (checkmark)       | Verde                   | Éxito: registro OK, borrado OK, correo enviado, registros borrados | ~3–5 s según el evento          |
+
+> El ícono de espera (marco) es el mismo que se restaura automáticamente cuando expira el temporizador de cualquier otro patrón, y también es el que aparece al terminar cada ciclo de parpadeo del backlight de la LCD.
 
 ---
 
@@ -307,9 +348,11 @@ El correo solo se envía si:
 
 Tres archivos CSV adjuntos:
 
-1. **Log de accesos** (`accesos_FECHAINICIO__FECHAFIN.csv`) — todos los eventos de acceso con timestamp, UID, nombre y código.
-2. **Entradas/Salidas** (`entradas_FECHAINICIO__FECHAFIN.csv`) — registros de tipo Entrada, Salida y Salida Pendiente.
-3. **Lista de usuarios** (`usuarios_FECHA.csv`) — todos los usuarios registrados al momento del envío.
+1. **Log de accesos** (`accesos_FECHAINICIO__FECHAFIN - N.csv`) — todos los eventos de acceso con timestamp, UID, nombre y código.
+2. **Entradas/Salidas** (`entradas_FECHAINICIO__FECHAFIN - N.csv`) — registros de tipo Entrada, Salida y Salida Pendiente.
+3. **Lista de usuarios** (`usuarios_FECHA - N.csv`) — todos los usuarios registrados al momento del envío.
+
+El sufijo ` - N` es un contador de correos enviados en el día (empieza en 1 y se reinicia cada día); permite distinguir varios envíos manuales del mismo día sin sobrescribir adjuntos con el mismo nombre. El asunto del correo también incluye la fecha y ese mismo contador, ej.: `Registros NFC - 2026-07-18 - 2`.
 
 ### Qué ocurre después del envío automático
 
@@ -338,13 +381,14 @@ La responsabilidad de descargar los logs manualmente y borrar la memoria antes d
 
 ### El PN532 no detecta tarjetas
 
-**Síntoma:** La LCD muestra "NFC ERROR / Revisar lector" o las tarjetas no se leen aunque estén bien acercadas.
+**Síntoma:** La LCD muestra "NFC ERROR / Reiniciando..." o las tarjetas no se leen aunque estén bien acercadas.
 
 **Causas y soluciones:**
 
-- **PN532 no configurado en modo I2C:** Verificar que los dos puentes (jumpers) o resistencias de selección de protocolo en el módulo PN532 estén en la posición I2C (generalmente SEL0=ON/HIGH, SEL1=OFF/LOW — consultar el datasheet del módulo específico).
-- **Bus I2C bloqueado:** El sistema tiene un watchdog que intenta recuperar el bus cada 15 segundos automáticamente. Si el problema persiste, reiniciar el ESP32.
-- **Conexiones sueltas:** Verificar continuidad en SDA (GPIO 21) y SCL (GPIO 22) desde el ESP32 al PN532.
+- **PN532 no configurado en modo HSU/UART:** Verificar que los puentes (jumpers) o resistencias de selección de protocolo en el módulo PN532 estén en la posición de comunicación **serial (HSU)**, no I2C ni SPI (consultar el datasheet del módulo específico).
+- **Conexiones cruzadas o sueltas:** Verificar RX2 (GPIO 16) del ESP32 conectado al TX del PN532, y TX2 (GPIO 17) del ESP32 conectado al RX del PN532. Si están invertidos, el chip no responde.
+- **Chip sin respuesta puntual:** El sistema tiene un watchdog que verifica el PN532 cada 5 segundos y, si no responde, reinicia automáticamente el UART2 (`nfcReinicializar()`). Si falla 5 veces seguidas (~25 s sin recuperación), el ESP32 se reinicia solo.
+- **Lecturas lentas repetidas:** Si el monitor serie muestra "NFC: lectura lenta (Xms)" de forma constante, puede indicar ruido en el cableado UART o una fuente de alimentación inestable para el PN532.
 - **Tarjeta incompatible:** El sistema lee tarjetas Mifare ISO14443A. Tarjetas de otros protocolos (como ISO14443B) no son soportadas.
 
 ### El RTC pierde la hora al reiniciar
@@ -355,7 +399,7 @@ La responsabilidad de descargar los logs manualmente y borrar la memoria antes d
 
 - **Batería CR2032 agotada o ausente:** Reemplazar la batería del módulo DS3231. Sin batería, el oscilador del DS3231 se detiene al quitar la alimentación principal y el chip pierde la hora.
 - **Firmware nuevo cargado:** En cada nueva compilación y carga de firmware, el sistema detecta el cambio por el `buildID` y sincroniza el RTC con la hora de compilación. Esto es comportamiento normal. Configurar NTP para corregirlo.
-- **Verificar conexiones del bus RTC:** SDA → GPIO 19, SCL → GPIO 18. Son pines distintos al bus del PN532.
+- **Verificar conexiones del bus RTC:** SDA → GPIO 19, SCL → GPIO 18. Es un bus I2C independiente, distinto al de la LCD y sin relación con el PN532 (que usa UART).
 
 ### Problemas de autenticación SMTP (correo no se envía)
 
@@ -374,10 +418,20 @@ La responsabilidad de descargar los logs manualmente y borrar la memoria antes d
 
 **Causas y soluciones:**
 
-- **Tipo de LED incorrecto:** Verificar si el LED es de **ánodo común** o **cátodo común** y ajustar `#define LED_ANODO_COMUN` en `src/main.cpp` (`true` para ánodo común, `false` para cátodo común).
+- **Tipo de LED incorrecto:** Verificar si el LED es de **ánodo común** o **cátodo común** y ajustar `#define LED_ANODO_COMUN` en `src/main.cpp` (`true` para ánodo común, `false` para cátodo común — el valor por defecto del código es `false`).
 - **Sin resistencias limitadoras:** Los pines GPIO del ESP32 no toleran corriente directa sin resistencia. Conectar una resistencia de 100–220 Ω en serie con cada canal (R, G, B).
 - **Pines incorrectos:** Los pines del LED son GPIO 25 (R), GPIO 26 (G), GPIO 27 (B). Verificar conexiones.
-- **Canal R y G invertidos:** El amarillo en ánodo común resulta de activar R y G simultáneamente. Si aparece un color distinto al esperado, los canales físicos pueden no corresponder al orden R-G-B del módulo. Intercambiar los pines en las constantes del código.
+- **Canal R y G invertidos:** El amarillo resulta de activar R y G simultáneamente. Si aparece un color distinto al esperado, los canales físicos pueden no corresponder al orden R-G-B del módulo. Intercambiar los pines en las constantes del código.
+
+### La matriz de LEDs no enciende o muestra colores incorrectos
+
+**Síntoma:** La matriz WS2812B permanece apagada, muestra píxeles de colores aleatorios, o solo enciende parcialmente.
+
+**Causas y soluciones:**
+
+- **Pin de datos incorrecto o suelto:** La matriz se controla por GPIO 23 (`MATRIZ_PIN`). Verificar la conexión DIN de la matriz a ese pin.
+- **Alimentación insuficiente:** 64 LEDs WS2812B pueden exigir más corriente de la que entrega el regulador del ESP32 si el brillo fuera alto. El firmware limita el brillo a 60/255 precisamente para mitigar esto; si aun así hay parpadeo o colores erráticos, alimentar la matriz con una fuente de 5 V externa (compartiendo GND con el ESP32).
+- **Orden de color equivocado:** El firmware asume LEDs `GRB` (estándar WS2812B). Si los colores aparecen intercambiados (verde donde debería ir rojo, etc.), el módulo podría usar un orden distinto.
 
 ### La LCD muestra caracteres extraños o está en blanco
 
@@ -387,7 +441,7 @@ La responsabilidad de descargar los logs manualmente y borrar la memoria antes d
 
 - **Dirección I2C incorrecta:** La dirección predeterminada del módulo PCF8574 es `0x27`. Algunos módulos usan `0x3F`. Verificar con un escáner I2C o revisar las soldaduras A0/A1/A2 del módulo.
 - **Contraste desajustado:** El módulo LCD tiene un potenciómetro de contraste (tornillo pequeño en la parte trasera). Ajustarlo hasta que los caracteres sean visibles.
-- **Bus I2C compartido con PN532 interrumpido:** El sistema incluye recuperación automática del bus. Si el problema es intermitente, el watchdog del PN532 debería resolverlo. Si es persistente, verificar las conexiones físicas.
+- **Conexiones del bus Wire:** La LCD tiene su propio bus I2C (SDA GPIO 21, SCL GPIO 22), sin compartirlo con el PN532 (que usa UART) ni con el RTC (que usa su propio bus I2C en pines 19/18). Si el problema es intermitente, verificar las conexiones físicas de ese bus específico.
 
 ### Aparece el banner "Correo con logs no enviado"
 

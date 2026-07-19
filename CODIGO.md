@@ -10,20 +10,23 @@ Referencia para desarrolladores que lean, entiendan o modifiquen `src/main.cpp`.
 2. [Organización del código](#organización-del-código)
 3. [Sistema de timers no bloqueantes con millis()](#sistema-de-timers-no-bloqueantes-con-millis)
 4. [Máquina de estados del LED RGB](#máquina-de-estados-del-led-rgb)
-5. [Sistema de cierre de día](#sistema-de-cierre-de-día)
-6. [Bus I2C compartido PN532 + LCD y watchdog](#bus-i2c-compartido-pn532--lcd-y-watchdog)
-7. [Anti-rebote y cooldown de tarjetas](#anti-rebote-y-cooldown-de-tarjetas)
-8. [Por qué existe ARCHIVO_UIDS además de NVS](#por-qué-existe-archivo_uids-además-de-nvs)
-9. [Lógica par/impar para entradas y salidas](#lógica-parimpar-para-entradas-y-salidas)
-10. [Secuencia de recuperación del bus I2C](#secuencia-de-recuperación-del-bus-i2c)
-11. [Consideraciones del DS3231 con RTClib](#consideraciones-del-ds3231-con-rtclib)
-12. [Decisiones de diseño no obvias](#decisiones-de-diseño-no-obvias)
+5. [Sistema de matriz LED WS2812B](#sistema-de-matriz-led-ws2812b)
+6. [Sistema de cierre de día](#sistema-de-cierre-de-día)
+7. [Comunicación UART con el PN532 y watchdog](#comunicación-uart-con-el-pn532-y-watchdog)
+8. [Anti-rebote y cooldown de tarjetas](#anti-rebote-y-cooldown-de-tarjetas)
+9. [Por qué existe ARCHIVO_UIDS además de NVS](#por-qué-existe-archivo_uids-además-de-nvs)
+10. [Lógica par/impar para entradas y salidas](#lógica-parimpar-para-entradas-y-salidas)
+11. [Secuencia de recuperación del UART del PN532](#secuencia-de-recuperación-del-uart-del-pn532)
+12. [Consideraciones del DS3231 con RTClib](#consideraciones-del-ds3231-con-rtclib)
+13. [Decisiones de diseño no obvias](#decisiones-de-diseño-no-obvias)
+14. [Diagrama de flujo del programa (para todos)](#diagrama-de-flujo-del-programa-para-todos)
+15. [Glosario técnico](#glosario-técnico)
 
 ---
 
 ## Arquitectura general
 
-Todo el código reside en un único archivo `src/main.cpp` (~1600 líneas). No hay módulos separados ni cabeceras propias. La única cabecera externa incluida directamente es `nvs.h` del ESP-IDF, necesaria para iterar las claves NVS.
+Todo el código reside en un único archivo `src/main.cpp` (~2000 líneas). No hay módulos separados ni cabeceras propias. La única cabecera externa incluida directamente es `nvs.h` del ESP-IDF, necesaria para iterar las claves NVS.
 
 ### Capas de almacenamiento
 
@@ -44,6 +47,8 @@ Todo el código reside en un único archivo `src/main.cpp` (~1600 líneas). No h
 │  ssidWifi   → SSID de la red WiFi con internet       │
 │  claveWifi  → contraseña WiFi                        │
 │  ntpOffset  → offset UTC en segundos (default -18000)│
+│  emailCntDate → "YYYY-MM-DD" del contador de correos │
+│  emailCnt   → int: correos enviados en emailCntDate  │
 └──────────────────────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────┐
 │ LittleFS (flash, partición min_spiffs)               │
@@ -58,14 +63,15 @@ Todo el código reside en un único archivo `src/main.cpp` (~1600 líneas). No h
 ```
 loop()
  ├── servidor.handleClient()         ← atender peticiones HTTP
- ├── lcdActualizarParpadeo()         ← backlight protector LCD
- ├── ledActualizar()                 ← máquina de estados LED
+ ├── lcdActualizarParpadeo()         ← backlight protector LCD (y apaga la matriz en cada ciclo)
+ ├── ledActualizar()                 ← máquina de estados LED RGB
+ ├── matrizActualizar()              ← revertir matriz WS2812B al ícono idle si expiró el timer
  ├── Expiración tiempoLcdHasta       ← revertir LCD al estado real
  ├── Detección WiFi nueva → NTP      ← sincronizar reloj al conectar
  ├── verificarNtpPendiente()         ← aplicar respuesta NTP async
  ├── Reintento WiFi (cada 30 s)      ← reconectar si se perdió
  ├── Tareas periódicas (cada 60 s)   ← cerrarDia + autoEnviarEmail
- ├── Watchdog PN532 (cada 15 s)      ← verificar salud del chip NFC
+ ├── Watchdog PN532 (cada 5 s)       ← verificar salud del chip NFC vía UART
  └── Lectura NFC (cada 300 ms)       ← leerUidUnaVez → procesar tarjeta
 ```
 
@@ -75,42 +81,44 @@ loop()
 
 | Sección | Líneas aprox. | Contenido |
 |---|---|---|
-| Includes y defines | 1–30 | Librerías, pines hardware, pines LED, archivos LittleFS |
-| Variables globales | 31–125 | Estado del sistema, timers, estado LED, estado NFC |
-| LED RGB — funciones | 126–185 | `ledAplicar`, `ledFijar`, `ledParpadear`, `ledActualizar`, `ledSetup` |
-| LCD — funciones | 186–220 | `lcdWakeUp`, `lcdActualizarParpadeo`, `lcdMostrar`, `lcdMostrarNombre` |
-| RTC DS3231 | 221–280 | Lectura, ajuste, sincronización con buildID y NTP |
-| HTML / pagina() | 281–310 | Estilos CSS inline, wrapper HTML de página |
-| Logs (LittleFS) | 311–370 | `logAgregar`, `logParsear`, `logHtml`, `logCsv` |
-| Entradas/salidas | 371–470 | `entradaAgregar`, `entradaParsear`, `entradaHtml`, `entradaCsv` |
-| Gestión de UIDs | 471–530 | `uidRegistrar`, `uidEliminar`, `reconstruirArchivoUids`, `usuariosHtml`, `usuariosCsv` |
-| NTP | 531–610 | `aplicarTiempoNtp`, `iniciarNtp`, `verificarNtpPendiente`, `sincronizarNtpManual` |
-| Limpieza atómica | 611–640 | `resetearContadoresNvs`, `limpiarRegistros` |
-| Email SMTP | 641–780 | `enviarEmail`, `nombreAdjunto`, `tsParaNombre`, `smtpCallback` |
-| Cierre de día | 781–880 | `cerrarDiaArranque`, `cerrarDia`, `autoEnviarEmail` |
-| Handlers web | 881–1350 | Un handler por cada ruta HTTP |
-| Watchdog NFC | 1351–1450 | `nfcReinicializar` |
-| NFC lectura | 1451–1480 | `uidAHex`, `leerUidUnaVez` |
-| `setup()` | 1481–1570 | Inicialización de todos los periféricos |
-| `loop()` | 1571–fin | Bucle principal |
+| Includes y defines | 1–38 | Librerías, pines hardware, pines LED, archivos LittleFS |
+| Variables globales | 39–126 | Estado del sistema, timers, estado LED, estado NFC |
+| LED RGB — funciones | 128–195 | `ledAplicar`, `ledFijar`, `ledParpadear`, `ledActualizar`, `ledSetup` |
+| Matriz WS2812B — funciones | 197–276 | Patrones, `matrizMostrar`, `matrizActualizar` |
+| LCD — funciones | 278–336 | `lcdWakeUp`, `lcdActualizarParpadeo`, `lcdMostrar`, `lcdMostrarNombre` |
+| RTC DS3231 | 338–412 | Lectura, ajuste, sincronización con buildID y NTP |
+| HTML / pagina() | 414–451 | Estilos CSS inline, wrapper HTML de página, banner de alerta |
+| Logs (LittleFS) | 453–531 | `logAgregar`, `logParsear`, `logHtml`, `logCsv` |
+| Entradas/salidas | 533–635 | `entradaAgregar`, `entradaParsear`, `entradaHtml`, `entradaCsv` |
+| Gestión de UIDs | 637–740 | `uidRegistrar`, `uidEliminar`, `reconstruirArchivoUids`, `usuariosHtml`, `usuariosCsv` |
+| NTP | 742–782 | `aplicarTiempoNtp`, `iniciarNtp`, `verificarNtpPendiente`, `sincronizarNtpManual` |
+| Limpieza atómica | 784–809 | `resetearContadoresNvs`, `limpiarRegistros` |
+| Email SMTP | 811–975 | `enviarEmail`, `nombreAdjunto`, `tsParaNombre`, `smtpCallback` |
+| Cierre de día | 977–1148 | `cerrarDiaArranque`, `cerrarDia`, `autoEnviarEmail` |
+| Handlers web | 1150–1662 | Un handler por cada ruta HTTP |
+| Watchdog NFC (UART) | 1664–1716 | `nfcReinicializar` |
+| NFC lectura | 1718–1758 | `uidAHex`, `leerUidUnaVez` |
+| `setup()` | 1760–1843 | Inicialización de todos los periféricos |
+| `loop()` | 1845–fin | Bucle principal |
 
 ---
 
 ## Sistema de timers no bloqueantes con millis()
 
-El sistema nunca usa `delay()` en el flujo normal (solo en `nfcReinicializar()` para la secuencia de recuperación del bus, donde es intencionalmente bloqueante). Todos los eventos periódicos se gestionan comparando `millis()` con un timestamp guardado.
+El sistema nunca usa `delay()` en el flujo normal (solo en `nfcReinicializar()` para la secuencia de recuperación del UART del PN532, donde es intencionalmente bloqueante). Todos los eventos periódicos se gestionan comparando `millis()` con un timestamp guardado.
 
 ### Timers activos
 
 | Variable | Intervalo | Propósito |
 |---|---|---|
 | `ultimaLecturaNfc` | 300 ms | Cadencia de lectura del PN532 |
-| `nfcUltimoCheck` | 15 000 ms | Watchdog: verificar salud del PN532 |
+| `nfcUltimoCheck` | 5 000 ms | Watchdog: verificar salud del PN532 vía UART |
 | `ultimoChequeoLimpieza` | 60 000 ms | Disparar `cerrarDia` y `autoEnviarEmail` |
 | `ultimaReconexionWifi` | 30 000 ms | Reintentar WiFi si se perdió la conexión |
 | `tiempoLcdHasta` | variable | Duración del mensaje temporal en LCD (3–4 s típico) |
-| `lcdIdleDesde` | 120 000 ms | Retardo antes de iniciar el parpadeo del backlight |
-| `lcdParpadeoNext` | 1 000 / 3 000 ms | Fase apagado / encendido del parpadeo backlight |
+| `lcdIdleDesde` | 1 000 ms | Retardo antes de iniciar el parpadeo continuo del backlight (`LCD_IDLE_BLINK_INICIO`) |
+| `lcdParpadeoNext` | 100 / 30 ms | Fase encendido / apagado del parpadeo continuo del backlight (`LCD_BLINK_ON_MS` / `LCD_BLINK_OFF_MS`); se repite mientras el sistema esté idle |
+| `matrizHasta` | variable | Duración del patrón activo en la matriz WS2812B; 0 = permanente hasta el próximo evento |
 | `ledFijoHasta` | variable | Duración del color fijo en el LED |
 | `ledProxCambio` | 200 / 250 ms | Fases apagado / encendido del parpadeo LED |
 | `tiempoUltimoUid` | 3 000 ms | Cooldown del mismo UID (anti-rebote temporal) |
@@ -139,6 +147,8 @@ El bloque de expiración consulta el **estado real del sistema** (`esperandoTarj
 ### Protección del backlight LCD
 
 Cuando `lcdIdleDesde == 0`, el parpadeo está completamente desactivado (`lcdActualizarParpadeo()` retorna inmediatamente). Se activa solo cuando `lcdIdleDesde` recibe un valor no nulo. `lcdWakeUp()` pone `lcdIdleDesde = 0` para suprimir el parpadeo mientras hay actividad. El bloque de expiración del timer reinicia `lcdIdleDesde = ahora` para que el conteo de inactividad empiece desde cero.
+
+Pasado `LCD_IDLE_BLINK_INICIO` (1000 ms) sin actividad, `lcdActualizarParpadeo()` entra en un ciclo **continuo** — no un destello puntual — alternando entre backlight encendido (`LCD_BLINK_ON_MS` = 100 ms) y apagado (`LCD_BLINK_OFF_MS` = 30 ms) mientras el sistema siga idle. En cada fase "apagado" también se apaga la matriz WS2812B (`fill_solid(... CRGB::Black)` + `FastLED.show()`); en cada fase "encendido" se restaura el ícono idle de la matriz (`matrizMostrar(PATRON_DISPONIBLE, ...)`). Ambos indicadores quedan así sincronizados en el mismo ciclo.
 
 **Regla:** cualquier función que muestre un mensaje temporal en la LCD debe llamar `lcdWakeUp()` antes de `lcdMostrar()` y, si el mensaje no tiene `tiempoLcdHasta` asociado (como en modos de espera indefinida), también debe poner `tiempoLcdHasta = 0` para cancelar cualquier timer pendiente anterior.
 
@@ -178,7 +188,62 @@ void ledAplicar(LedColor c) {
 }
 ```
 
-`LedColor` usa `bool` por canal (on/off). Cuando `LED_ANODO_COMUN = true`, los valores se invierten antes de escribir al GPIO: `true` (canal activo) → `LOW` en el pin. Cambiar la constante en tiempo de compilación es suficiente para soportar ambos tipos de LED.
+`LedColor` usa `bool` por canal (on/off). Cuando `LED_ANODO_COMUN = true`, los valores se invierten antes de escribir al GPIO: `true` (canal activo) → `LOW` en el pin. Cambiar la constante en tiempo de compilación es suficiente para soportar ambos tipos de LED. El valor por defecto actual en el código es `false` (cátodo común).
+
+---
+
+## Sistema de matriz LED WS2812B
+
+La matriz de 64 LEDs (8×8, GPIO 23, librería FastLED) funciona como un segundo canal visual, en paralelo al LED RGB y a la LCD: dibuja un ícono de 8×8 píxeles según el evento en curso.
+
+### Representación de los patrones
+
+Cada ícono es un `const uint8_t patron[8]`: un array de 8 filas, cada una un byte donde cada bit representa un píxel (1 = encendido, 0 = apagado). Por ejemplo, la fila `0b01111110` enciende las columnas 1 a 6 de esa fila.
+
+```cpp
+inline int matrizIdx(int col, int fila) { return fila * 8 + col; }
+
+void matrizMostrar(const uint8_t patron[8], CRGB color, unsigned long duracionMs = 0) {
+  for (int fila = 0; fila < 8; fila++) {
+    uint8_t bits = patron[fila];
+    for (int col = 0; col < 8; col++) {
+      matrizLeds[matrizIdx(col, fila)] = ((bits >> (7 - col)) & 1) ? color : CRGB::Black;
+    }
+  }
+  FastLED.show();
+  matrizHasta = (duracionMs > 0) ? millis() + duracionMs : 0;
+}
+```
+
+Los 64 LEDs están en un único array plano `matrizLeds[64]`; `matrizIdx()` traduce coordenadas (columna, fila) al índice del array. A diferencia de versiones anteriores pensadas para cableado serpentina, aquí todas las filas se recorren izquierda→derecha (sin alternar sentido en filas impares).
+
+### Patrones definidos
+
+| Patrón | Uso |
+|---|---|
+| `PATRON_DISPONIBLE` | Marco — ícono idle, sistema esperando tarjeta |
+| `PATRON_FLECHA_ARRIBA` | Flecha arriba — acceso permitido / tarjeta registrada leída |
+| `PATRON_X` | X — acceso denegado / tarjeta no registrada / error |
+| `PATRON_CHECK` | Checkmark — éxito (registro, borrado, correo enviado) |
+
+### Timer no bloqueante y reversión automática
+
+Igual que el patrón de `tiempoLcdHasta`, `matrizHasta` guarda el instante en que debe revertirse al ícono idle. `matrizActualizar()`, llamada en cada iteración de `loop()`, revierte a `PATRON_DISPONIBLE` cuando expira:
+
+```cpp
+void matrizActualizar() {
+  if (matrizHasta && millis() >= matrizHasta) {
+    matrizHasta = 0;
+    matrizMostrar(PATRON_DISPONIBLE, CRGB(100, 80, 0));  // amarillo tenue = idle
+  }
+}
+```
+
+`matrizHasta = 0` significa "patrón permanente" (no revertir automáticamente); esto se usa, por ejemplo, para dejar el resultado de un envío de correo visible varios segundos antes de que `matrizActualizar()` lo reemplace.
+
+### Por qué el patrón de éxito se muestra después de cerrar la sesión SMTP
+
+En `enviarEmail()`, el patrón `PATRON_CHECK`/`PATRON_X` se dibuja **después** de `smtp.closeSession()`, no antes. `closeSession()` puede tardar 1–5 s; si el patrón se mostrara antes, su temporizador de varios segundos podría expirar mientras el cierre de sesión SMTP sigue bloqueando el `loop()`, y el usuario vería el ícono idle en vez del resultado real del envío.
 
 ---
 
@@ -215,33 +280,36 @@ Además de las dos funciones anteriores, la lectura normal en `loop()` también 
 
 ---
 
-## Bus I2C compartido PN532 + LCD y watchdog
+## Comunicación UART con el PN532 y watchdog
 
-### El problema
+### Aislamiento del PN532 respecto a los buses I2C
 
-El PN532 (NFC) y la LCD 20×4 comparten el mismo bus I2C (Wire, pines 21/22). El PN532 usa timeouts internos y secuencias de inicialización que mantienen el bus activo durante períodos prolongados. Si la LCD realiza una transacción I2C mientras el PN532 tiene una lectura en progreso, puede dejar el bus en un estado inconsistente: uno de los dispositivos puede quedar con SDA en nivel bajo, bloqueando indefinidamente el bus.
+El PN532 se comunica por **UART2** (`Serial2`, pines RX2=16/TX2=17) en modo HSU, a través de la librería `PN532_HSU` de Seeed-Studio (`lib_deps` apunta a `github.com/Seeed-Studio/PN532`, y `platformio.ini` define `-DNFC_INTERFACE_HSU`). No usa I2C en absoluto, por lo que no comparte controlador ni pines con la LCD (`Wire`, pines 21/22) ni con el RTC (`busRtc`, pines 19/18). Esto elimina de raíz el riesgo — presente en versiones anteriores del proyecto que sí ponían el PN532 en el mismo bus I2C que la LCD — de que una transacción de un dispositivo deje el bus del otro en un estado inconsistente.
 
-Con `Wire.setTimeOut(200)`, cada transacción tiene un máximo de 200 ms. Sin este timeout, una transacción bloqueada detendría el sistema completo.
+`Wire.setTimeOut(200)` sigue aplicando solo al bus I2C de la LCD, limitando cada transacción I2C a 200 ms para que un cuelgue de la LCD no detenga el sistema completo.
 
 ### El watchdog PN532
 
-Cada `NFC_CHECK_INTERVALO` (15 segundos), `loop()` llama a `lectorNfc.getFirmwareVersion()`. Si retorna 0, el chip no responde y se invoca `nfcReinicializar()`. Ver la sección siguiente para el detalle de esa función.
+Cada `NFC_CHECK_INTERVALO` (5 segundos), `loop()` vacía el buffer de `Serial2` y llama a `lectorNfc.getFirmwareVersion()`. Si retorna 0, el chip no responde y se invoca `nfcReinicializar()` (ver la sección siguiente).
 
 ```cpp
 if (ahora - nfcUltimoCheck >= NFC_CHECK_INTERVALO) {
     nfcUltimoCheck = ahora;
+    while (Serial2.available()) Serial2.read();  // descartar bytes residuales
     if (!lectorNfc.getFirmwareVersion()) {
+        Serial.println("NFC WDG: chip no responde — iniciando recuperacion automatica");
         nfcReinicializar();
         return;  // reiniciar el loop con el estado restaurado
     }
+    while (Serial2.available()) Serial2.read();  // limpiar la respuesta del chequeo exitoso
 }
 ```
 
-El `return` después de `nfcReinicializar()` es deliberado: evita que el resto del loop procese una lectura NFC inmediatamente después de la recuperación, cuando el bus podría estar todavía asentándose.
+El `return` después de `nfcReinicializar()` es deliberado: evita que el resto del loop procese una lectura NFC inmediatamente después de la recuperación, cuando el UART podría estar todavía asentándose.
 
-### Por qué el lector NFC usa el mismo bus que la LCD
+### Detección temprana de lecturas lentas
 
-El ESP32 tiene dos controladores I2C hardware (`Wire` y `Wire1`, usados aquí como `Wire` y `busRtc`). El RTC DS3231 usa `busRtc` (pines 19/18). El PN532 y la LCD deben compartir `Wire` (pines 21/22) porque no hay un tercer bus I2C hardware disponible y una solución por software (bit-banging) añadiría complejidad incompatible con la librería del PN532.
+`leerUidUnaVez()` mide cuánto tarda cada `readPassiveTargetID()` (timeout interno de 100 ms). Si tarda más de 200 ms, además de registrarlo en el monitor serie, vacía el buffer de `Serial2` y fuerza `nfcUltimoCheck = 0` para que el watchdog corra en el siguiente ciclo de `loop()` en vez de esperar los 5 segundos completos — una lectura anormalmente lenta suele ser síntoma temprano de un chip a punto de dejar de responder.
 
 ---
 
@@ -262,7 +330,7 @@ Si el UID leído es el mismo que el anterior Y la tarjeta todavía está física
 
 ### Nivel 2: cooldown temporal
 
-`COOLDOWN_TARJETA = 3000 ms`. Incluso si la tarjeta se retira y se vuelve a acercar dentro de los 3 segundos, el UID sigue siendo ignorado. Esto cubre el efecto "flicker" del PN532 en I2C: el chip a veces deja de reportar una tarjeta presente por un instante aunque la tarjeta no se haya movido, porque una transacción I2C de la LCD interrumpió su ciclo de polling.
+`COOLDOWN_TARJETA = 3000 ms`. Incluso si la tarjeta se retira y se vuelve a acercar dentro de los 3 segundos, el UID sigue siendo ignorado. Esto cubre el efecto "flicker" del PN532: el chip a veces deja de reportar una tarjeta presente por un instante aunque la tarjeta no se haya movido (por ejemplo, por una lectura UART puntualmente ruidosa o lenta — ver [Detección temprana de lecturas lentas](#comunicación-uart-con-el-pn532-y-watchdog)).
 
 ### Por qué `ultimoUid` no se borra al retirar la tarjeta
 
@@ -326,43 +394,43 @@ El contador se incrementa **antes** de escribir, de modo que el valor guardado e
 
 ---
 
-## Secuencia de recuperación del bus I2C
+## Secuencia de recuperación del UART del PN532
 
-`nfcReinicializar()` implementa la secuencia estándar de recuperación de bus I2C (IEEE §3.1.16) adaptada al ESP32:
+`nfcReinicializar()` reinicia por completo el canal `Serial2` y reintenta comunicarse con el chip, con reintentos crecientes y un auto-reinicio del ESP32 como último recurso:
 
 ```
-Paso 1: Wire.end()
-        Libera el controlador I2C del ESP32. Sin esto, los pines siguen
-        controlados por el periférico y las manipulaciones GPIO directas
-        del paso 2 entran en conflicto.
+Paso 1: Serial2.end() + delay(300)
+        Cierra completamente el driver UART del ESP32 para limpiar
+        cualquier estado interno de una transmisión a medio completar.
 
-Paso 2: 9 pulsos en SCL (pin 22 como salida, SDA pin 21 como entrada)
-        Un dispositivo I2C que quedó en medio de una transmisión puede
-        tener SDA en nivel bajo (esperando enviar más bits). La especificación
-        I2C indica que 9 pulsos de reloj liberan cualquier slave bloqueado,
-        porque ninguna trama válida tiene más de 9 bits consecutivos de datos.
+Paso 2: Serial2.begin(115200, SERIAL_8N1, 16, 17) + delay(100)
+        Reabre el UART2 con los pines explícitos (RX2=16, TX2=17) y
+        vacía cualquier byte que haya quedado en el buffer de recepción.
 
-Paso 3: Condición STOP (SDA sube mientras SCL está en alto)
-        Indica a todos los dispositivos del bus que la transacción ha
-        terminado y el bus vuelve al estado libre (SDA=HIGH, SCL=HIGH).
+Paso 3: Preámbulo de sincronismo — 6 bytes 0x55
+        Se envían 6 bytes 0x55 puros (sin comando SAMConfig embebido) para
+        realinear el framing UART del PN532. Después se vuelve a vaciar
+        el buffer de recepción.
 
-Paso 4: Wire.begin(21, 22) + Wire.setTimeOut(200)
-        Reinicializa el controlador I2C del ESP32 con el timeout de seguridad.
+Paso 4: Hasta 3 intentos de lectorNfc.getFirmwareVersion()
+        Entre cada intento fallido se espera un tiempo creciente
+        (300 ms × número de intento) y se limpia el buffer antes de
+        reintentar. Si algún intento responde, v != 0 y el chip se
+        considera recuperado.
 
-Paso 5: lcd.init() + lcd.backlight()
-        La LCD puede haber perdido su estado de inicialización durante la
-        recuperación (los pulsos de SCL también la alcanzan). Se reinicializa
-        para garantizar que vuelva a mostrar correctamente.
+Paso 5a (éxito): fallosConsec = 0; lectorNfc.SAMConfig()
+        Se reconfigura el modo del PN532 y se restaura el mensaje
+        correspondiente en la LCD (registrando, eliminando o esperando
+        tarjeta, según el estado real del sistema en ese momento).
 
-Paso 6: lectorNfc.begin() + Wire.begin(21, 22) nuevamente
-        lectorNfc.begin() incluye un pulso RESET en el pin configurado
-        del PN532. En este hardware el pin RESET del PN532 no está separado
-        del SCL (comparten el pin 22), lo que puede reconfigurar el pin
-        como GPIO. Por eso se llama a Wire.begin() nuevamente después de
-        begin() para restaurar la configuración I2C.
+Paso 5b (fallo): se muestra "NFC ERROR / Reiniciando..." en la LCD.
+        Se incrementa fallosConsec (contador estático que persiste entre
+        llamadas). Si llega a 5 fallos consecutivos (~25 s sin recuperación
+        exitosa), el firmware llama a ESP.restart() para reiniciar todo
+        el ESP32 automáticamente.
 ```
 
-Por qué el segundo `Wire.begin()` después de `lectorNfc.begin()`: la librería Adafruit_PN532 puede internamente llamar a funciones que reconfiguran los pines del bus. Llamar `Wire.begin()` nuevamente es un seguro que no tiene coste adicional y garantiza que el bus queda configurado correctamente.
+A diferencia de una recuperación de bus I2C (pulsos de reloj manuales, condición STOP), esta secuencia no manipula pines a bajo nivel: el UART del ESP32 se puede cerrar y reabrir limpiamente con `Serial2.end()`/`begin()`, algo que el protocolo I2C no permite de forma tan directa. El auto-reinicio tras 5 fallos consecutivos es la única red de seguridad para el caso en que el PN532 quedó en un estado del que el software no puede sacarlo (por ejemplo, un corte de alimentación parcial solo del módulo NFC).
 
 ---
 
@@ -370,7 +438,7 @@ Por qué el segundo `Wire.begin()` después de `lectorNfc.begin()`: la librería
 
 ### Bus independiente
 
-El DS3231 usa `TwoWire busRtc = TwoWire(1)` (controlador I2C número 1 del ESP32, pines 19/18). Esto lo aísla completamente del PN532 y la LCD, que están en `Wire` (controlador 0, pines 21/22). Un bus colgado en Wire no afecta al RTC.
+El DS3231 usa `TwoWire busRtc = TwoWire(1)` (controlador I2C número 1 del ESP32, pines 19/18). Esto lo aísla completamente de la LCD, que está en `Wire` (controlador I2C 0, pines 21/22), y del PN532, que ni siquiera usa I2C (va por `Serial2`/UART, pines 16/17). Un bus colgado en `Wire` no afecta al RTC.
 
 ### Detección de pérdida de alimentación
 
@@ -455,10 +523,94 @@ Hora 12 (mediodía)  → reintentar si WiFi disponible y no enviado aún
 Hora 13+            → ambas ventanas agotadas → activar emailPendienteFlag
 ```
 
-La función corre cada 60 segundos. Dentro de cada ventana horaria, retrying each minute is useful for temporary WiFi drops. El guard `lastEmail == today` previene doble envío.
+La función corre cada 60 segundos. Dentro de cada ventana horaria, reintentar cada minuto es útil para cubrir caídas temporales del WiFi. El guard `lastEmail == today` previene doble envío.
 
 La **bandera `emailPendienteFlag`** es un `bool` en RAM respaldado por `emailPend` (bool en NVS). Se inicializa desde NVS en `setup()` para sobrevivir reinicios. Se activa cuando `hora > 12` en un día de envío sin `lastEmail == today`. Se desactiva:
 1. Cuando `enviarEmail()` con `borrarTras=true` completa con éxito (situación resuelta automáticamente).
 2. Cuando el usuario hace clic en **✓ Confirmar** del banner y confirma en el diálogo JS (`handleConfirmarEmailPend()` limpia la bandera en NVS y redirige a `/`).
 
 `bannerAlerta()` es llamada desde `pagina()` en cada respuesta HTTP — si `emailPendienteFlag` es `false` retorna `""` y el overhead es nulo. Si es `true`, inyecta el div de advertencia al inicio del `<body>` en todas las páginas sin necesidad de modificar cada handler individualmente.
+
+---
+
+## Diagrama de flujo del programa (para todos)
+
+Esta sección explica **qué hace el programa, en orden**, sin asumir conocimientos previos de programación. Los términos técnicos que aparecen están marcados así* y explicados en el [glosario](#glosario-técnico) al final.
+
+### 1. Arranque del sistema
+
+```mermaid
+flowchart TD
+    A(["🔌 Se enciende el ESP32*"]) --> B["Inicializa pantalla, matriz de LEDs, reloj (RTC*) y lector NFC*"]
+    B --> C["Enciende el WiFi propio (AP*) y, si hay una red guardada, intenta conectarse a internet"]
+    C --> D{"¿Quedó alguna tarjeta con 'Entrada' registrada<br>pero sin 'Salida' del día anterior?<br>(por ejemplo, por un corte de luz)"}
+    D -- Sí --> E["Cierra esas entradas como<br>'Salida: Pendiente'"]
+    D -- No --> F["Arranca el servidor web y entra al bucle principal"]
+    E --> F
+    F --> G(["▶️ Bucle principal (loop)"])
+```
+
+### 2. Bucle principal — qué pasa todo el tiempo
+
+El programa nunca usa pausas que bloqueen el sistema*: en cada vuelta del bucle atiende la página web, revisa si hay una tarjeta nueva, actualiza la pantalla y los LEDs, y cada cierto tiempo revisa el correo y la salud del lector NFC.
+
+```mermaid
+flowchart TD
+    G(["▶️ Bucle principal"]) --> H["Atiende la página web y actualiza<br>pantalla / LED / matriz de LEDs"]
+    H --> I{"¿Hay una tarjeta nueva<br>sobre el lector?"}
+    I -- No --> J["Cada 60 s: revisa si cambió el día<br>y si toca enviar el correo automático<br><br>Cada 5 s: revisa que el lector NFC<br>responda (watchdog*)"]
+    J --> G
+    I -- Sí --> K{"¿En qué modo está<br>el sistema ahora mismo?"}
+    K -- "Registrando un usuario nuevo" --> L["Guarda el UID* de la tarjeta<br>junto al nombre y código"]
+    K -- "Borrando un usuario" --> M["Elimina esa tarjeta<br>de la lista de usuarios"]
+    K -- "Lectura normal" --> N{"¿Esa tarjeta está<br>registrada?"}
+    N -- No --> O["Muestra 'NO_REGISTRADO'<br>LED y matriz en rojo"]
+    N -- Sí --> P{"¿Le tocaba Entrada<br>o Salida?"}
+    P --> Q["Guarda el evento en el historial<br>LED y matriz en verde"]
+    L --> R["Confirma en pantalla, LED,<br>matriz y la página web"]
+    M --> R
+    O --> G
+    Q --> G
+    R --> G
+```
+
+### 3. Cierre de día y correo automático (tarea de fondo cada 60 s)
+
+```mermaid
+flowchart TD
+    S(["⏱️ Cada 60 segundos"]) --> T{"¿Cambió la fecha desde<br>la última revisión?"}
+    T -- Sí --> U["Cierra el día: cualquier tarjeta que<br>haya quedado en 'Entrada' pasa a<br>'Salida: Pendiente' y su contador se reinicia"]
+    T -- No --> V["No hace nada"]
+    U --> W{"¿Es día 10, 20 o el último<br>del mes, y es medianoche<br>o mediodía?"}
+    V --> W
+    W -- "Sí, y hay internet" --> X["Envía un correo* con 3 archivos adjuntos:<br>accesos, entradas/salidas y usuarios"]
+    W -- No --> Y["Espera a la próxima revisión"]
+    X -- "Envío correcto y es día de limpieza" --> Z["Borra los archivos de historial<br>y reinicia los contadores"]
+    X -- "Falló en las dos ventanas del día" --> AA["Muestra un aviso amarillo<br>en todas las páginas web"]
+```
+
+> Estos tres diagramas se corresponden con las funciones `setup()`, `loop()` (con sus tres ramas: registrar, borrar, lectura normal) y `cerrarDia()` + `autoEnviarEmail()` en `src/main.cpp`.
+
+---
+
+## Glosario técnico
+
+| Término | Explicación en palabras simples |
+|---|---|
+| **ESP32** | El microcontrolador (mini-computadora) que ejecuta todo el programa. |
+| **NFC** | Tecnología de comunicación de corto alcance que permite leer el identificador de una tarjeta o llavero sin contacto físico. |
+| **UID** | El número de serie único que trae grabado cada tarjeta NFC; es lo que el sistema usa para reconocer a cada usuario. |
+| **RTC** | Reloj en Tiempo Real (Real-Time Clock): un chip aparte con su propia pila que sigue contando la hora aunque el ESP32 esté apagado. |
+| **AP (Access Point)** | El propio ESP32 crea una red WiFi (`NFC`) a la que cualquier celular o computador se puede conectar directamente, sin necesidad de internet. |
+| **NVS** | Memoria no volátil del ESP32 (tipo llave→valor) donde se guardan los usuarios, contadores y configuración; sobrevive a reinicios y cortes de luz. |
+| **LittleFS** | Un sistema de archivos dentro de la memoria flash del ESP32; ahí se guardan los archivos de historial (`logs.txt`, `entradas.txt`) como si fuera un disco duro pequeño. |
+| **I2C / UART (HSU)** | Dos formas distintas de conectar chips entre sí con pocos cables. I2C usa 2 cables compartidos por varios dispositivos (lo usan la pantalla y el reloj); UART usa una conexión serial dedicada de punto a punto (la usa el lector NFC). |
+| **Watchdog** | Una revisión periódica que verifica que un componente (aquí, el lector NFC) siga funcionando, y lo reinicia automáticamente si deja de responder. |
+| **Anti-rebote / debounce** | Un filtro que evita que una misma tarjeta, acercada una sola vez, se registre varias veces por lecturas repetidas en milisegundos. |
+| **No bloqueante** | Una forma de programar en la que el sistema nunca se queda "congelado" esperando algo (como un temporizador); sigue atendiendo todo lo demás mientras tanto. |
+| **WS2812B / FastLED** | El modelo de LED direccionable que forma la matriz de 8×8, y la librería que se usa para dibujar patrones de colores en ella. |
+| **SMTP** | El protocolo usado para enviar los correos electrónicos con los reportes adjuntos (a través de Gmail, en este proyecto). |
+| **NTP** | El protocolo que sincroniza la hora del sistema con servidores de internet, para mantener el reloj exacto cuando hay conexión. |
+| **Contador par/impar** | El sistema decide "Entrada" o "Salida" simplemente contando: la primera lectura del día es Entrada (impar), la segunda es Salida (par), y así sucesivamente. |
+| **Heap / OOM** | La memoria RAM disponible para datos temporales del programa. "OOM" (Out Of Memory) es quedarse sin esa memoria; el sistema evita esto limitando cuántos registros carga a la vez. |
+| **Patrón "buzón" (mailbox)** | Cómo la página web se entera de que se leyó una tarjeta: el navegador pregunta ("¿ya pasó algo?") cada 700 ms hasta que el programa deja una respuesta guardada para recogerla. |
