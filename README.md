@@ -325,7 +325,9 @@ Esta información permite detectar correctamente si hubo una Entrada sin Salida 
 
 ### Cuándo se envía
 
-El sistema envía automáticamente un correo en los **días 10, 20 y el último día del mes**. Hay dos ventanas de envío por día:
+El sistema envía automáticamente un correo **todos los días**, no solo los días 10, 20 y último del mes. Esos tres días son especiales únicamente porque, además de enviar, **también borran los archivos de historial** después del envío exitoso (ver [Qué ocurre después del envío automático](#qué-ocurre-después-del-envío-automático)). El resto de los días el correo se envía igual, pero los archivos se conservan y se van acumulando.
+
+Hay dos ventanas de envío por día:
 
 | Ventana | Hora       | Comportamiento                                                      |
 | ------- | ---------- | ------------------------------------------------------------------- |
@@ -340,9 +342,9 @@ El correo solo se envía si:
 
 **Si el ESP32 estaba apagado en la ventana de medianoche**, al arrancar entre las 0:01 y las 11:59 el sistema espera la ventana del mediodía para reintentar. Si arranca después de las 12:59 sin haber enviado, activa la alerta de reporte pendiente.
 
-**Si el ESP32 estuvo apagado todo el día de envío** y arranca al día siguiente o más tarde, el sistema detecta el envío perdido comparando `lastEmail` con el último día de envío que debió haber ocurrido y activa la alerta de reporte pendiente si hay datos en los archivos de registro.
+**Si el ESP32 estuvo apagado un día entero** (o más) y arranca después, el sistema detecta el envío perdido comparando `lastEmail` con el día anterior (recordá que el envío es diario, no solo los días 10/20/último) y activa la alerta de reporte pendiente si hay datos en los archivos de registro.
 
-**Primera instalación:** En el primer arranque con código nuevo, el sistema registra la fecha de compilación como punto de partida para evitar falsos positivos. La primera fecha real de envío automático será el siguiente día programado (10, 20 o último del mes) después de la instalación.
+**Primera instalación:** En el primer arranque con código nuevo, el sistema registra la fecha de compilación como punto de partida para evitar falsos positivos. El primer envío automático real ocurrirá al día siguiente de la instalación (no hay que esperar a un día 10, 20 o último del mes para que empiece a mandar correos; esos días solo determinan cuándo se borran los archivos).
 
 ### Contenido del correo
 
@@ -356,13 +358,15 @@ El sufijo ` - N` es un contador de correos enviados en el día (empieza en 1 y s
 
 ### Qué ocurre después del envío automático
 
-Tras un envío automático exitoso, el sistema **borra ambos archivos de registro** (`/logs.txt` y `/entradas.txt`) y **resetea a 0 los contadores** de todas las tarjetas. La lista de usuarios (NVS) **no se borra**.
+El envío automático diario **no borra nada por sí solo**. El borrado solo ocurre cuando se cumplen dos condiciones a la vez: el envío fue exitoso **y** el día es 10, 20 o el último del mes. En ese caso, el sistema **borra ambos archivos de registro** (`/logs.txt` y `/entradas.txt`) y **resetea a 0 los contadores** de todas las tarjetas. La lista de usuarios (NVS) **no se borra**.
 
-El envío **manual** (botón "Enviar por email" en la web) genera el mismo correo pero **no borra los archivos**.
+El resto de los días (envío exitoso pero no es día de limpieza), el correo se manda igual pero los archivos **se conservan** y siguen acumulando eventos hasta el próximo día de limpieza.
+
+El envío **manual** (botón "Enviar por email" en la web) genera el mismo correo pero **nunca borra los archivos**, sin importar el día.
 
 ### Alerta de reporte pendiente
 
-Si ambas ventanas del día de envío pasan sin que el correo se haya podido enviar (sin internet en todo el día, o el ESP32 estuvo apagado en ambas ventanas), el sistema activa una **bandera de reporte pendiente** que se guarda en NVS y persiste entre reinicios.
+Como el envío es diario, esto puede pasar cualquier día (no solo los días de limpieza): si ambas ventanas de un día pasan sin que el correo se haya podido enviar (sin internet en todo el día, o el ESP32 estuvo apagado en ambas ventanas), el sistema activa una **bandera de reporte pendiente** que se guarda en NVS y persiste entre reinicios.
 
 Mientras la bandera esté activa, **todas las páginas de la interfaz web** muestran un banner de advertencia:
 
@@ -449,8 +453,8 @@ La responsabilidad de descargar los logs manualmente y borrar la memoria antes d
 
 **Cuándo aparece:**
 
-- **Ambas ventanas de envío fallaron en el mismo día:** El sistema intentó a medianoche y al mediodía, pero ambas fallaron (sin WiFi o error SMTP). Los archivos no fueron borrados.
-- **El sistema estuvo apagado el día de envío y arrancó después:** Si el ESP32 volvió a encender en un día posterior al día de envío y el correo nunca se mandó, el banner aparece al detectar el historial sin enviar.
+- **Ambas ventanas de envío fallaron en el mismo día:** El sistema intentó a medianoche y al mediodía, pero ambas fallaron (sin WiFi o error SMTP). Como el envío es diario, esto puede pasar cualquier día, no solo los días 10/20/último. Si además era un día de limpieza, los archivos no fueron borrados.
+- **El sistema estuvo apagado un día entero y arrancó después:** Si el ESP32 volvió a encender en un día posterior a uno en que debía enviar y el correo nunca se mandó, el banner aparece al detectar el historial sin enviar.
 
 > **Nota:** El banner persiste en todos los reinicios hasta que el usuario lo confirma manualmente. Es intencional que no desaparezca solo.
 

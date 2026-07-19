@@ -512,9 +512,19 @@ La variable `lcdPost` (enum `LcdPost { LCD_IDLE, LCD_LISTO }`) se asigna en vari
 
 ### Sistema de dos ventanas para auto-envío de correo y bandera de pendiente
 
-El borrado automático de archivos solo ocurre tras un envío de correo exitoso con `borrarTras=true`. No existe limpieza automática independiente del correo. El razonamiento: borrar sin enviar significaría pérdida de datos irrecuperable; el correo es la confirmación de que los datos están en destino.
+**El envío automático es diario, no solo los días 10/20/último del mes.** `esDiaLimpieza` (`fh.dia == 10 || fh.dia == 20 || fh.dia == ud`) NO condiciona si se envía el correo — solo se usa como el argumento `borrarTras` que se le pasa a `enviarEmail()`. Es decir: `autoEnviarEmail()` intenta enviar todos los días en las mismas dos ventanas horarias, pero **el borrado automático de archivos solo ocurre tras un envío exitoso en un día de limpieza** (`borrarTras=true`). El resto de los días, el envío se completa igual pero los archivos quedan intactos. No existe limpieza automática independiente del correo: borrar sin enviar significaría pérdida de datos irrecuperable, y el correo es la confirmación de que los datos están en destino.
 
-`autoEnviarEmail()` intenta el envío en dos ventanas horarias del día programado:
+```cpp
+bool esDiaLimpieza = (fh.dia == 10 || fh.dia == 20 || fh.dia == ud);
+...
+if (lastEmail == String(hoy)) return;  // ya enviado hoy — corre todos los días
+if (fh.hora == 0 || fh.hora == 12) {
+    ...
+    bool ok = enviarEmail(logCsv(), entradaCsv(), esDiaLimpieza, true);
+    //                                             ^^^^^^^^^^^^^ solo controla el borrado, no el envío
+```
+
+`autoEnviarEmail()` intenta el envío en dos ventanas horarias **cada día**:
 
 ```
 Hora 0 (medianoche) → intentar si WiFi disponible
@@ -523,9 +533,9 @@ Hora 12 (mediodía)  → reintentar si WiFi disponible y no enviado aún
 Hora 13+            → ambas ventanas agotadas → activar emailPendienteFlag
 ```
 
-La función corre cada 60 segundos. Dentro de cada ventana horaria, reintentar cada minuto es útil para cubrir caídas temporales del WiFi. El guard `lastEmail == today` previene doble envío.
+La función corre cada 60 segundos. Dentro de cada ventana horaria, reintentar cada minuto es útil para cubrir caídas temporales del WiFi. El guard `lastEmail == today` previene doble envío el mismo día.
 
-La **bandera `emailPendienteFlag`** es un `bool` en RAM respaldado por `emailPend` (bool en NVS). Se inicializa desde NVS en `setup()` para sobrevivir reinicios. Se activa cuando `hora > 12` en un día de envío sin `lastEmail == today`. Se desactiva:
+La **bandera `emailPendienteFlag`** es un `bool` en RAM respaldado por `emailPend` (bool en NVS). Se inicializa desde NVS en `setup()` para sobrevivir reinicios. Se activa cuando `hora > 12` en **cualquier día** (no solo los de limpieza) sin `lastEmail == today`, o cuando `calcularUltimoEnvioPasado()` detecta que no se envió nada el día anterior. Se desactiva:
 1. Cuando `enviarEmail()` con `borrarTras=true` completa con éxito (situación resuelta automáticamente).
 2. Cuando el usuario hace clic en **✓ Confirmar** del banner y confirma en el diálogo JS (`handleConfirmarEmailPend()` limpia la bandera en NVS y redirige a `/`).
 
@@ -576,17 +586,23 @@ flowchart TD
 
 ### 3. Cierre de día y correo automático (tarea de fondo cada 60 s)
 
+El envío de correo es **diario**, todos los días del mes — es un error común (¡y en el que cayó una versión anterior de este mismo documento!) pensar que solo se envía los días 10, 20 y último. Lo único que distingue a esos tres días es que, si el envío tiene éxito, además se borra el historial.
+
 ```mermaid
 flowchart TD
     S(["⏱️ Cada 60 segundos"]) --> T{"¿Cambió la fecha desde<br>la última revisión?"}
     T -- Sí --> U["Cierra el día: cualquier tarjeta que<br>haya quedado en 'Entrada' pasa a<br>'Salida: Pendiente' y su contador se reinicia"]
     T -- No --> V["No hace nada"]
-    U --> W{"¿Es día 10, 20 o el último<br>del mes, y es medianoche<br>o mediodía?"}
+    U --> W{"¿Ya se envió el<br>correo hoy?"}
     V --> W
-    W -- "Sí, y hay internet" --> X["Envía un correo* con 3 archivos adjuntos:<br>accesos, entradas/salidas y usuarios"]
-    W -- No --> Y["Espera a la próxima revisión"]
-    X -- "Envío correcto y es día de limpieza" --> Z["Borra los archivos de historial<br>y reinicia los contadores"]
-    X -- "Falló en las dos ventanas del día" --> AA["Muestra un aviso amarillo<br>en todas las páginas web"]
+    W -- Sí --> Y1["No hace nada más hoy"]
+    W -- No --> W2{"¿Es medianoche o<br>mediodía, y hay internet?"}
+    W2 -- No --> Y2["Espera a la próxima<br>ventana horaria"]
+    W2 -- Sí --> X["Intenta enviar un correo* con<br>3 archivos adjuntos: accesos,<br>entradas/salidas y usuarios<br>(esto pasa TODOS LOS DÍAS)"]
+    X -- Éxito --> AB{"¿Hoy es día 10, 20<br>o el último del mes?"}
+    AB -- Sí --> Z["Borra los archivos de historial<br>y reinicia los contadores"]
+    AB -- No --> AC["Los archivos NO se borran;<br>se acumulan para el próximo envío"]
+    X -- "Falla, y ya pasó<br>la ventana del mediodía" --> AA["Muestra un aviso amarillo<br>en todas las páginas web"]
 ```
 
 > Estos tres diagramas se corresponden con las funciones `setup()`, `loop()` (con sus tres ramas: registrar, borrar, lectura normal) y `cerrarDia()` + `autoEnviarEmail()` en `src/main.cpp`.
