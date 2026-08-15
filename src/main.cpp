@@ -306,12 +306,24 @@ void lcdActualizarParpadeo() {
 }
 
 // ── LCD ──────────────────────────────────────────────────────
+// Trunca una cadena UTF-8 a lo sumo maxBytes bytes SIN partir un caracter
+// multibyte (tildes, enie, etc.). Si el corte cae en medio de una secuencia
+// UTF-8, retrocede hasta excluirla completa. Sin esto, un nombre con tilde
+// que se corta a la mitad manda un byte suelto e invalido a la LCD, que lo
+// muestra como un simbolo aleatorio de su tabla de caracteres (HD44780).
+String truncarUtf8(const String& s, int maxBytes) {
+  if ((int)s.length() <= maxBytes) return s;
+  int corte = maxBytes;
+  while (corte > 0 && ((uint8_t)s[corte] & 0xC0) == 0x80) corte--;
+  return s.substring(0, corte);
+}
+
 void lcdMostrar(String l1, String l2, String l3, String l4) {
   lcd.clear();
   String ls[4] = { l1, l2, l3, l4 };
   for (int i = 0; i < 4; i++) {
     lcd.setCursor(0, i);
-    if (ls[i].length() > 20) ls[i] = ls[i].substring(0, 20);
+    if (ls[i].length() > 20) ls[i] = truncarUtf8(ls[i], 20);
     lcd.print(ls[i]);
   }
 }
@@ -326,7 +338,7 @@ void lcdMostrarNombre(String nombreCompleto, String codigo) {
     }
   }
   // Linea 4: token[3] hasta col 14, codigo alineado a la derecha en cols 14-19
-  String linea4 = tok[3].substring(0, min((int)tok[3].length(), 14));
+  String linea4 = truncarUtf8(tok[3], 14);
   while ((int)linea4.length() < 14) linea4 += ' ';
   codigo = codigo.substring(0, min((int)codigo.length(), 6));
   String codAli = "";
@@ -450,6 +462,30 @@ String pagina(const String& titulo, const String& cuerpo) {
          + bannerAlerta() + cuerpo + "</body></html>";
 }
 
+// Escapa caracteres especiales de HTML. El nombre y el codigo de un usuario
+// se insertan tal cual en varias paginas (logs, entradas, usuarios, confir-
+// macion de registro/borrado) y en /done y /deleted incluso se leen directo
+// de un parametro de la URL sin pasar por NVS. Sin escapar, alguien podria
+// registrar (o enlazar) un nombre como "<img src=x onerror=fetch('/clear
+// Registros')>" y ejecutarlo en el navegador de quien despues abra esa
+// pagina (XSS reflejado/almacenado) — con este sistema sin login, eso le
+// bastaria para borrar todos los registros de otra persona sin darse cuenta.
+String escapeHtml(const String& s) {
+  String r; r.reserve(s.length());
+  for (int i = 0; i < (int)s.length(); i++) {
+    char c = s[i];
+    switch (c) {
+      case '&':  r += "&amp;";  break;
+      case '<':  r += "&lt;";   break;
+      case '>':  r += "&gt;";   break;
+      case '"':  r += "&quot;"; break;
+      case '\'': r += "&#39;";  break;
+      default:   r += c;
+    }
+  }
+  return r;
+}
+
 // ── Logs de acceso (LittleFS) ─────────────────────────────────
 void logAgregar(const String& ts, const String& uid, const String& nombre, const String& codigo) {
   File f = LittleFS.open(ARCHIVO_LOG, "a");
@@ -469,6 +505,20 @@ bool logParsear(const String& entrada, String &ts, String &uid, String &nombre, 
 }
 
 // Mensaje de error de memoria reutilizable en logHtml / entradaHtml.
+// Cuenta lineas ('\n') leyendo en bloques en vez de byte a byte. Con un
+// archivo de historial grande (meses sin limpiar) leer un byte a la vez
+// multiplica la sobrecarga de la llamada virtual de File::read() por cada
+// byte del archivo; leer en bloques de 512 reduce esas llamadas ~500x.
+static int contarLineas(File& f) {
+  uint8_t bloque[512];
+  int total = 0;
+  int leidos;
+  while ((leidos = f.read(bloque, sizeof(bloque))) > 0) {
+    for (int i = 0; i < leidos; i++) if (bloque[i] == '\n') total++;
+  }
+  return total;
+}
+
 static String errorMemoria(const char* descarga, const char* prefijo) {
   return String("<div class='card' style='border-color:#dc3545'>"
          "<p><b>&#9888; Memoria insuficiente para mostrar los registros.</b></p>"
@@ -486,8 +536,7 @@ String logHtml() {
     f.close();
     return errorMemoria("/downloadLogs", "accesos");
   }
-  int total = 0;
-  while (f.available()) { if (f.read() == '\n') total++; }
+  int total = contarLineas(f);
   f.seek(0);
   int mostrar = min(total, 300), saltar = total - mostrar;
   String* buf = new String[mostrar];
@@ -506,8 +555,8 @@ String logHtml() {
   for (int i = n - 1; i >= 0; i--) {
     String ts, uid, nombre, codigo;
     if (!logParsear(buf[i], ts, uid, nombre, codigo)) continue;
-    r += "<div><b>" + nombre + "</b>";
-    if (codigo.length()) r += " <span class='muted'>[" + codigo + "]</span>";
+    r += "<div><b>" + escapeHtml(nombre) + "</b>";
+    if (codigo.length()) r += " <span class='muted'>[" + escapeHtml(codigo) + "]</span>";
     r += " <span class='muted'>(UID: " + uid + ")</span><br>"
          "<span class='ts'>&#128336; " + ts + "</span></div><hr>";
   }
@@ -558,8 +607,7 @@ String entradaHtml() {
     f.close();
     return errorMemoria("/downloadEntradas", "entradas");
   }
-  int total = 0;
-  while (f.available()) { if (f.read() == '\n') total++; }
+  int total = contarLineas(f);
   f.seek(0);
   int mostrar = min(total, 300), saltar = total - mostrar;
   String* buf = new String[mostrar];
@@ -573,11 +621,25 @@ String entradaHtml() {
   }
   f.close();
 
-  const int MAX_UIDS = 100;
-  String uids[MAX_UIDS]; int nu = 0;
-  for (int i = 0; i < n && nu < MAX_UIDS; i++) {
+  // Pre-extraer solo el UID de cada linea UNA vez y reutilizarlo como filtro
+  // barato en los bucles de abajo, en vez de volver a parsear la linea
+  // completa (entradaParsear asigna varios String nuevos) hasta nu*n*2 veces.
+  // Con historiales grandes sin limpiar eso llegaba a decenas de miles de
+  // parseos por cada visita a /entradas, saturando/fragmentando el heap.
+  // El limite de UIDs distintos tambien pasa de un tope fijo (100) a "n"
+  // (maximo real: los eventos mostrados, <=300), asi ningun usuario queda
+  // excluido de la agrupacion solo por haber mas de 100 personas distintas.
+  String* pUid = new String[n];
+  String* uids = new String[n];
+  int nu = 0;
+  if (!pUid || !uids) {
+    delete[] buf; delete[] pUid; delete[] uids;
+    return errorMemoria("/downloadEntradas", "entradas");
+  }
+  for (int i = 0; i < n; i++) {
     String ts, uid, nombre, codigo, tipo;
     if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
+    pUid[i] = uid;
     bool existe = false;
     for (int j = 0; j < nu; j++) { if (uids[j] == uid) { existe = true; break; } }
     if (!existe) uids[nu++] = uid;
@@ -590,16 +652,18 @@ String entradaHtml() {
   for (int u = 0; u < nu; u++) {
     String nombreGrupo = uids[u];
     for (int i = 0; i < n; i++) {
+      if (pUid[i] != uids[u]) continue;
       String ts, uid, nombre, codigo, tipo;
       if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
-      if (uid == uids[u]) { nombreGrupo = nombre; break; }
+      nombreGrupo = nombre;
+      break;
     }
     r += "<div class='card' style='margin:6px 0'>"
-         "<b>" + nombreGrupo + "</b> <span class='muted'>(UID: " + uids[u] + ")</span>";
+         "<b>" + escapeHtml(nombreGrupo) + "</b> <span class='muted'>(UID: " + uids[u] + ")</span>";
     for (int i = 0; i < n; i++) {
+      if (pUid[i] != uids[u]) continue;
       String ts, uid, nombre, codigo, tipo;
       if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
-      if (uid != uids[u]) continue;
       if (tipo == "Salida: Pendiente") {
         r += "<div style='padding:3px 0 3px 8px'>"
              "<span class='pendiente'>&#x25cf; Salida: Pendiente</span>"
@@ -615,7 +679,7 @@ String entradaHtml() {
     }
     r += "</div>";
   }
-  delete[] buf;
+  delete[] buf; delete[] pUid; delete[] uids;
   return r + "</div>";
 }
 
@@ -730,8 +794,8 @@ String usuariosHtml() {
     if (!nombre.length()) continue;
     String codigo = almacen.getString(("k" + uid).c_str(), "");
     r += "<tr><td style='padding:5px;font-family:monospace' class='muted'>" + uid +
-         "</td><td style='padding:5px'><b>" + nombre +
-         "</b></td><td style='padding:5px'>" + codigo + "</td></tr>";
+         "</td><td style='padding:5px'><b>" + escapeHtml(nombre) +
+         "</b></td><td style='padding:5px'>" + escapeHtml(codigo) + "</td></tr>";
     total++;
   }
   f.close();
@@ -802,10 +866,19 @@ void resetearContadoresNvs() {
 // Debe llamarse en TODOS los escenarios de borrado (manual y automatico) para
 // mantener el sistema en un estado completamente consistente.
 void limpiarRegistros() {
-  LittleFS.remove(ARCHIVO_LOG);
-  LittleFS.remove(ARCHIVO_ENT);
+  // Se verifica el resultado real del borrado (antes se ignoraba el retorno
+  // de LittleFS.remove()): si el borrado a nivel de archivo llegara a fallar
+  // por cualquier motivo, ahora queda registrado explicitamente en el log
+  // serie en vez de reportarse como exito silenciosamente.
+  bool existiaLog = LittleFS.exists(ARCHIVO_LOG);
+  bool existiaEnt = LittleFS.exists(ARCHIVO_ENT);
+  bool okLog = !existiaLog || LittleFS.remove(ARCHIVO_LOG);
+  bool okEnt = !existiaEnt || LittleFS.remove(ARCHIVO_ENT);
   resetearContadoresNvs();
-  Serial.println("LIMPIEZA: logs, entradas y contadores NVS reseteados.");
+  if (!okLog) Serial.println("LIMPIEZA: ADVERTENCIA - no se pudo borrar " ARCHIVO_LOG);
+  if (!okEnt) Serial.println("LIMPIEZA: ADVERTENCIA - no se pudo borrar " ARCHIVO_ENT);
+  Serial.println(String("LIMPIEZA: logs, entradas y contadores NVS reseteados.")
+                  + ((okLog && okEnt) ? "" : " (con advertencias, ver arriba)"));
 }
 
 // ── Email ─────────────────────────────────────────────────────
@@ -1127,10 +1200,15 @@ void autoEnviarEmail() {
 
   if (fh.hora == 0 || fh.hora == 12) {
     if (WiFi.status() != WL_CONNECTED) return;
-    Serial.printf("AUTO-EMAIL: ventana hora %d, generando CSV...\n", fh.hora);
+    Serial.printf("AUTO-EMAIL: ventana hora %d, dia=%d (dia de limpieza=%s), generando CSV...\n",
+                  fh.hora, fh.dia, esDiaLimpieza ? "SI" : "NO");
     bool ok = enviarEmail(logCsv(), entradaCsv(), esDiaLimpieza, true);
-    Serial.println(ok ? "AUTO-EMAIL enviado: " + String(hoy)
-                      : "AUTO-EMAIL: fallo en ventana hora " + String(fh.hora));
+    if (ok) {
+      Serial.println("AUTO-EMAIL enviado: " + String(hoy)
+                     + (esDiaLimpieza ? " -> se borra la memoria" : " -> hoy NO es dia de limpieza, memoria NO se borra"));
+    } else {
+      Serial.println("AUTO-EMAIL: fallo en ventana hora " + String(fh.hora));
+    }
   } else if (fh.hora > 12) {
     // Ambas ventanas del dia ya pasaron sin envio exitoso
     if (!emailPendienteFlag) {
@@ -1200,6 +1278,19 @@ void handleSaveName() {
   if (!codigoPendiente.length() || codigoPendiente.length() > 6) {
     servidor.send(400, "text/plain", "Codigo invalido (1-6 caracteres)"); return;
   }
+  // "|" es el separador de campos en logs.txt/entradas.txt: si el nombre lo
+  // contuviera, corromperia el formato de TODAS sus lineas de historial.
+  if (nombrePendiente.indexOf('|') >= 0) {
+    servidor.send(400, "text/plain", "El nombre no puede contener el caracter '|'"); return;
+  }
+  // El codigo se valida server-side (antes solo el HTML del formulario lo
+  // restringia a [A-Za-z0-9], lo cual un cliente distinto al navegador podia
+  // saltarse facilmente enviando el POST directo).
+  for (int i = 0; i < (int)codigoPendiente.length(); i++) {
+    if (!isalnum((unsigned char)codigoPendiente[i])) {
+      servidor.send(400, "text/plain", "Codigo invalido: solo letras y numeros (A-Z, a-z, 0-9)"); return;
+    }
+  }
   esperandoTarjeta = true; modoEliminar = false;
   tarjetaPresente = false; ultimoUid = ""; tiempoUltimoUid = 0;
   tiempoLcdHasta = 0;  // cancelar timer pendiente; no debe sobreescribir ni activar blink
@@ -1207,8 +1298,8 @@ void handleSaveName() {
   lcdMostrar("Registrando:", nombrePendiente, "Acerca tarjeta", "");
   servidor.send(200, "text/html", pagina("Acerca la tarjeta",
     "<h2>Acerca la tarjeta</h2><div class='card'>"
-    "<p>Nombre: <b>" + nombrePendiente + "</b></p>"
-    "<p>Codigo: <b>" + codigoPendiente + "</b></p>"
+    "<p>Nombre: <b>" + escapeHtml(nombrePendiente) + "</b></p>"
+    "<p>Codigo: <b>" + escapeHtml(codigoPendiente) + "</b></p>"
     "<p id='st'>Esperando...</p>"
     "<script>setInterval(async()=>{let t=await(await fetch('/status')).text();"
     "if(t.startsWith('OK|'))location.href='/done?d='+encodeURIComponent(t);"
@@ -1255,10 +1346,13 @@ void handleDone() {
   if (datos.startsWith("OK|")) {
     int pos1 = datos.indexOf('|'), pos2 = datos.indexOf('|', pos1+1),
         pos3 = datos.indexOf('|', pos2+1), pos4 = (pos3>0) ? datos.indexOf('|', pos3+1) : -1;
-    cuerpo += "<p>UID: <b>" + datos.substring(pos1+1, pos2) + "</b></p>"
-              "<p>Nombre: <b>" + datos.substring(pos2+1, pos3>0?pos3:datos.length()) + "</b></p>";
-    if (pos3 > 0) cuerpo += "<p>Codigo: <b>" + datos.substring(pos3+1, pos4>0?pos4:datos.length()) + "</b></p>";
-    if (pos4 > 0) cuerpo += "<p class='ts'>&#128336; " + datos.substring(pos4+1) + "</p>";
+    // "datos" viene del parametro de URL "d" (servidor.arg("d")), sin validar
+    // contra el buzon real — cualquiera puede armar esta URL a mano, asi que
+    // TODO lo que se extraiga de ahi se escapa antes de insertarlo en HTML.
+    cuerpo += "<p>UID: <b>" + escapeHtml(datos.substring(pos1+1, pos2)) + "</b></p>"
+              "<p>Nombre: <b>" + escapeHtml(datos.substring(pos2+1, pos3>0?pos3:datos.length())) + "</b></p>";
+    if (pos3 > 0) cuerpo += "<p>Codigo: <b>" + escapeHtml(datos.substring(pos3+1, pos4>0?pos4:datos.length())) + "</b></p>";
+    if (pos4 > 0) cuerpo += "<p class='ts'>&#128336; " + escapeHtml(datos.substring(pos4+1)) + "</p>";
   } else cuerpo += "<p class='muted'>Sin datos.</p>";
   cuerpo += "<a href='/'><button>Inicio</button></a> <a href='/logs'><button>Ver logs</button></a></div>";
   servidor.send(200, "text/html", pagina("Registrado", cuerpo));
@@ -1270,13 +1364,15 @@ void handleDeleted() {
   if (datos.startsWith("DELETED|")) {
     int pos1 = datos.indexOf('|'), pos2 = datos.indexOf('|', pos1+1),
         pos3 = datos.indexOf('|', pos2+1);
+    // Ver comentario equivalente en handleDone(): "datos" es un parametro de
+    // URL sin validar, se escapa todo antes de insertarlo en HTML.
     cuerpo += "<p style='color:#dc3545;font-weight:bold'>&#10003; Usuario eliminado</p>"
-              "<p>UID: <b>" + datos.substring(pos1+1, pos2) + "</b></p>"
-              "<p>Nombre: <b>" + datos.substring(pos2+1, pos3>0?pos3:datos.length()) + "</b></p>";
-    if (pos3 > 0) cuerpo += "<p>Codigo: <b>" + datos.substring(pos3+1) + "</b></p>";
+              "<p>UID: <b>" + escapeHtml(datos.substring(pos1+1, pos2)) + "</b></p>"
+              "<p>Nombre: <b>" + escapeHtml(datos.substring(pos2+1, pos3>0?pos3:datos.length())) + "</b></p>";
+    if (pos3 > 0) cuerpo += "<p>Codigo: <b>" + escapeHtml(datos.substring(pos3+1)) + "</b></p>";
   } else if (datos.startsWith("NOT_FOUND|")) {
     cuerpo += "<p style='color:#ff9800;font-weight:bold'>&#9888; Tarjeta no registrada</p>"
-              "<p>UID: <b>" + datos.substring(datos.indexOf('|')+1) + "</b></p>";
+              "<p>UID: <b>" + escapeHtml(datos.substring(datos.indexOf('|')+1)) + "</b></p>";
   } else cuerpo += "<p class='muted'>Sin datos.</p>";
   cuerpo += "<a href='/'><button>Inicio</button></a> <a href='/register'><button>Registrar</button></a></div>";
   servidor.send(200, "text/html", pagina("Usuario borrado", cuerpo));
@@ -1306,8 +1402,7 @@ void handleLogs() {
   if (!f || !f.size()) {
     servidor.sendContent("<div class='card'><div class='muted'>No hay eventos registrados.</div></div>");
   } else {
-    int total = 0;
-    while (f.available()) { if (f.read() == '\n') total++; }
+    int total = contarLineas(f);
     f.seek(0);
     int mostrar = min(total, 300), saltar = total - mostrar;
     String* buf = new String[mostrar];
@@ -1328,8 +1423,8 @@ void handleLogs() {
       for (int i = n - 1; i >= 0; i--) {
         String ts, uid, nombre, codigo;
         if (!logParsear(buf[i], ts, uid, nombre, codigo)) continue;
-        String row = "<div><b>" + nombre + "</b>";
-        if (codigo.length()) row += " <span class='muted'>[" + codigo + "]</span>";
+        String row = "<div><b>" + escapeHtml(nombre) + "</b>";
+        if (codigo.length()) row += " <span class='muted'>[" + escapeHtml(codigo) + "]</span>";
         row += " <span class='muted'>(UID: " + uid + ")</span><br>"
                "<span class='ts'>&#128336; " + ts + "</span></div><hr>";
         servidor.sendContent(row);
@@ -1405,8 +1500,7 @@ void handleEntradas() {
   if (!f || !f.size()) {
     servidor.sendContent("<div class='card'><div class='muted'>No hay registros de entradas/salidas.</div></div>");
   } else {
-    int total = 0;
-    while (f.available()) { if (f.read() == '\n') total++; }
+    int total = contarLineas(f);
     f.seek(0);
     int mostrar = min(total, 300), saltar = total - mostrar;
     String* buf = new String[mostrar];
@@ -1425,11 +1519,28 @@ void handleEntradas() {
       servidor.sendContent("<div class='card'><div class='muted'>Total: " + String(total)
         + " registros" + (total > 300 ? " (mostrando los ultimos 300)" : "") + "</div><hr>");
 
-      const int MAX_UIDS = 100;
-      String uids[MAX_UIDS]; int nu = 0;
-      for (int i = 0; i < n && nu < MAX_UIDS; i++) {
+      // Ver comentario equivalente en entradaHtml(): pre-extraer el UID de
+      // cada linea una sola vez evita re-parsear (y re-asignar memoria) hasta
+      // decenas de miles de veces con historiales grandes sin limpiar, y el
+      // limite de UIDs distintos pasa de un tope fijo (100) a "n" (<=300) para
+      // no excluir usuarios de la vista agrupada.
+      String* pUid = new String[n];
+      String* uids = new String[n];
+      int nu = 0;
+      if (!pUid || !uids) {
+        delete[] buf; delete[] pUid; delete[] uids;
+        servidor.sendContent(errorMemoria("/downloadEntradas", "entradas"));
+        servidor.sendContent("</div>");
+        servidor.sendContent(
+          "<div style='margin:20px 0;display:flex;flex-wrap:wrap;gap:8px'>"
+          "<a href='/'><button>Volver</button></a></div></body></html>");
+        servidor.sendContent("");
+        return;
+      }
+      for (int i = 0; i < n; i++) {
         String ts, uid, nombre, codigo, tipo;
         if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
+        pUid[i] = uid;
         bool existe = false;
         for (int j = 0; j < nu; j++) { if (uids[j] == uid) { existe = true; break; } }
         if (!existe) uids[nu++] = uid;
@@ -1438,16 +1549,18 @@ void handleEntradas() {
       for (int u = 0; u < nu; u++) {
         String nombreGrupo = uids[u];
         for (int i = 0; i < n; i++) {
+          if (pUid[i] != uids[u]) continue;
           String ts, uid, nombre, codigo, tipo;
           if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
-          if (uid == uids[u]) { nombreGrupo = nombre; break; }
+          nombreGrupo = nombre;
+          break;
         }
         servidor.sendContent("<div class='card' style='margin:6px 0'>"
-          "<b>" + nombreGrupo + "</b> <span class='muted'>(UID: " + uids[u] + ")</span>");
+          "<b>" + escapeHtml(nombreGrupo) + "</b> <span class='muted'>(UID: " + uids[u] + ")</span>");
         for (int i = 0; i < n; i++) {
+          if (pUid[i] != uids[u]) continue;
           String ts, uid, nombre, codigo, tipo;
           if (!entradaParsear(buf[i], ts, uid, nombre, codigo, tipo)) continue;
-          if (uid != uids[u]) continue;
           String row;
           if (tipo == "Salida: Pendiente") {
             row = "<div style='padding:3px 0 3px 8px'>"
@@ -1465,7 +1578,7 @@ void handleEntradas() {
         }
         servidor.sendContent("</div>");
       }
-      delete[] buf;
+      delete[] buf; delete[] pUid; delete[] uids;
       servidor.sendContent("</div>");
     }
   }
@@ -1528,6 +1641,20 @@ void handleConfig() {
   if (emailEstado.startsWith("Enviado")) emailColor = "#28a745";
   else if (emailEstado.startsWith("Error")) emailColor = "#dc3545";
 
+  // Info de diagnostico: si HOY corresponde a un dia de limpieza (10, 20 o
+  // ultimo del mes). El envio automatico es diario; el borrado de memoria
+  // solo ocurre esos tres dias tras un envio exitoso — ver el envio manual
+  // ("Enviar por email" en /logs) NUNCA borra memoria, sin importar el dia.
+  String diaLimpiezaStr = "RTC no disponible";
+  if (rtcDisponible) {
+    FechaHora fhCfg = rtcLeerFechaHora();
+    int udCfg = ultimoDiaDelMes(fhCfg.mes, fhCfg.anio);
+    bool esDiaLimpiezaHoy = (fhCfg.dia == 10 || fhCfg.dia == 20 || fhCfg.dia == udCfg);
+    diaLimpiezaStr = esDiaLimpiezaHoy
+      ? "<span style='color:#28a745'>Si</span> (el proximo envio automatico exitoso hoy borrara la memoria)"
+      : "<span style='color:#666'>No</span> (proximo dia de limpieza: 10, 20 o " + String(udCfg) + " de este mes)";
+  }
+
   servidor.send(200, "text/html", pagina("Configuracion",
     "<h2>&#9881; Configuracion</h2>"
 
@@ -1544,9 +1671,11 @@ void handleConfig() {
     "<input type='number' name='ntpOffsetH' min='-12' max='14' value='" + offsetHStr + "'><br><br>"
     "<button type='submit'>&#10003; Guardar y reconectar</button></form>"
     "<p class='muted'>Ultimo envio automatico de correo: " + ultimoEmail + "</p>"
+    "<p class='muted'>&#191;Hoy es dia de limpieza (se borra la memoria tras el envio)? " + diaLimpiezaStr + "</p>"
     "<p class='muted'>Reportes automaticos diarios a medianoche "
     "(reintento al mediodia si falla). La memoria se borra solo los dias 10, 20 y ultimo "
-    "del mes, despues de verificar el envio. Si ambos intentos fallan, aparece alerta en la web.</p>"
+    "del mes, despues de verificar el envio. Si ambos intentos fallan, aparece alerta en la web. "
+    "El envio manual (boton \"Enviar por email\" en /logs o /entradas) NUNCA borra memoria, sin importar el dia.</p>"
     "</div>"
 
     "<div class='card'><h3>&#128336; Sincronizacion NTP</h3>"
