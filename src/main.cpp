@@ -20,6 +20,8 @@
 #define ARCHIVO_LOG   "/logs.txt"
 #define ARCHIVO_ENT   "/entradas.txt"
 #define ARCHIVO_UIDS  "/uids.txt"
+#define ARCHIVO_LOG_TMP  "/logs.tmp"
+#define ARCHIVO_ENT_TMP  "/entradas.tmp"
 
 // ── LED RGB ───────────────────────────────────────────────────────────────────
 // GPIOs libres (no usados por I2C ni otros perifericos del sistema).
@@ -34,8 +36,9 @@
 // ── Credenciales SMTP del remitente (cambiar antes de compilar) ──
 #define SMTP_HOST        "smtp.gmail.com"
 #define SMTP_PORT        587   // 587=STARTTLS (Gmail recomendado) | 465=SSL implicito
-#define REMITENTE_EMAIL  "rafael.arias@institutotebaida.edu.co"
-#define REMITENTE_CLAVE  "dqanxyjsspeotimc"  // App Password de Gmail (16 chars, sin espacios)
+#define REMITENTE_EMAIL  "registronfc@institutotebaida.edu.co"
+#define REMITENTE_CLAVE  "srsvssjelizheonk"
+//#define REMITENTE_CLAVE  "dqanxyjsspeotimc"  // App Password de Gmail de rafael.arias@institutotebaida.edu.co (16 chars, sin espacios)
 
 TwoWire           busRtc = TwoWire(1);
 RTC_DS3231        rtcDs3231;
@@ -101,6 +104,15 @@ const unsigned long LCD_BLINK_OFF_MS      = 30UL;    // ms con luz apagada
 // si no responde, reinicializa el puerto UART2 y el chip automaticamente.
 unsigned long nfcUltimoCheck = 0;
 const unsigned long NFC_CHECK_INTERVALO = 5000UL;   // verificar salud cada 5 s
+
+// ── Auto-sanacion periodica de la LCD ──────────────────────────
+// El controlador HD44780 de la LCD no tiene forma de "avisar" si quedo en
+// un estado inconsistente por ruido electrico en el bus I2C (aparecen
+// simbolos aleatorios que lcd.clear() por si solo no siempre corrige). Como
+// unica defensa posible sin lectura de vuelta del display, se reinicializa
+// por completo (lcd.init()) cada cierto tiempo cuando esta en reposo.
+unsigned long lcdUltimoRefresco = 0;
+const unsigned long LCD_REFRESCO_INTERVALO = 600000UL;  // reinicializar cada 10 min
 
 // ── LED RGB: maquina de estados no bloqueante ─────────────────────────────────
 // Estados:
@@ -509,12 +521,25 @@ bool logParsear(const String& entrada, String &ts, String &uid, String &nombre, 
 // archivo de historial grande (meses sin limpiar) leer un byte a la vez
 // multiplica la sobrecarga de la llamada virtual de File::read() por cada
 // byte del archivo; leer en bloques de 512 reduce esas llamadas ~500x.
+// Actualiza LCD/LED/matriz y cede tiempo al sistema (yield). Se llama
+// periodicamente dentro de los bucles largos de /logs y /entradas para que
+// esas paginas no dejen "congelados" el parpadeo de la LCD ni la matriz
+// mientras se generan — antes esas funciones solo se ejecutaban de vuelta
+// en loop(), una vez terminada toda la respuesta HTTP.
+inline void refrescarPeriferia() {
+  lcdActualizarParpadeo();
+  ledActualizar();
+  matrizActualizar();
+  yield();
+}
+
 static int contarLineas(File& f) {
   uint8_t bloque[512];
   int total = 0;
   int leidos;
   while ((leidos = f.read(bloque, sizeof(bloque))) > 0) {
     for (int i = 0; i < leidos; i++) if (bloque[i] == '\n') total++;
+    refrescarPeriferia();
   }
   return total;
 }
@@ -674,7 +699,7 @@ String entradaHtml() {
              "<span class='" + cls + "'>&#x25cf; " + tipo + "</span>"
              " <span class='ts'>&#128336; " + ts + "</span>";
       }
-      if (codigo.length()) r += " <span class='muted'>[" + codigo + "]</span>";
+      if (codigo.length()) r += " <span class='muted'>[" + escapeHtml(codigo) + "]</span>";
       r += "</div>";
     }
     r += "</div>";
@@ -696,6 +721,68 @@ String entradaCsv() {
   }
   f.close();
   return r;
+}
+
+// Reescribe ARCHIVO_LOG y ARCHIVO_ENT actualizando retroactivamente el
+// nombre/codigo de TODAS las lineas que pertenezcan a "uid", dejando el
+// resto de cada linea (timestamp, tipo Entrada/Salida) intacto. Se usa:
+//  - al registrar una tarjeta, para que las lecturas viejas que quedaron
+//    marcadas "NO_REGISTRADO" pasen a mostrar el nombre recien puesto.
+//  - al borrar una tarjeta, llamando con nuevoNombre="NO_REGISTRADO" y
+//    nuevoCodigo="" para que el historial vuelva a decir eso.
+// Reescribe linea a linea a un archivo temporal (sin cargar el historial
+// completo en RAM) y al final reemplaza el archivo original.
+void actualizarNombreHistorico(const String& uid, const String& nuevoNombre, const String& nuevoCodigo) {
+  File finLog = LittleFS.open(ARCHIVO_LOG, "r");
+  if (finLog) {
+    File foutLog = LittleFS.open(ARCHIVO_LOG_TMP, "w");
+    if (foutLog) {
+      while (finLog.available()) {
+        String l = finLog.readStringUntil('\n'); l.trim();
+        refrescarPeriferia();
+        if (!l.length()) continue;
+        String ts, u, nombre, codigo;
+        if (logParsear(l, ts, u, nombre, codigo) && u == uid) {
+          foutLog.println(ts + "|" + u + "|" + nuevoNombre + "|" + nuevoCodigo);
+        } else {
+          foutLog.println(l);
+        }
+      }
+      foutLog.close();
+      finLog.close();
+      LittleFS.remove(ARCHIVO_LOG);
+      LittleFS.rename(ARCHIVO_LOG_TMP, ARCHIVO_LOG);
+    } else {
+      finLog.close();
+      Serial.println("HISTORICO: no se pudo abrir " ARCHIVO_LOG_TMP ", logs.txt no actualizado");
+    }
+  }
+
+  File finEnt = LittleFS.open(ARCHIVO_ENT, "r");
+  if (finEnt) {
+    File foutEnt = LittleFS.open(ARCHIVO_ENT_TMP, "w");
+    if (foutEnt) {
+      while (finEnt.available()) {
+        String l = finEnt.readStringUntil('\n'); l.trim();
+        refrescarPeriferia();
+        if (!l.length()) continue;
+        String ts, u, nombre, codigo, tipo;
+        if (entradaParsear(l, ts, u, nombre, codigo, tipo) && u == uid) {
+          foutEnt.println(ts + "|" + u + "|" + nuevoNombre + "|" + nuevoCodigo + "|" + tipo);
+        } else {
+          foutEnt.println(l);
+        }
+      }
+      foutEnt.close();
+      finEnt.close();
+      LittleFS.remove(ARCHIVO_ENT);
+      LittleFS.rename(ARCHIVO_ENT_TMP, ARCHIVO_ENT);
+    } else {
+      finEnt.close();
+      Serial.println("HISTORICO: no se pudo abrir " ARCHIVO_ENT_TMP ", entradas.txt no actualizado");
+    }
+  }
+  Serial.println("HISTORICO: " + uid + " -> nombre/codigo actualizado en logs.txt/entradas.txt");
 }
 
 // ── Usuarios (ARCHIVO_UIDS + NVS) ────────────────────────────
@@ -1413,6 +1500,7 @@ void handleLogs() {
       int n = 0, fila = 0;
       while (f.available()) {
         String l = f.readStringUntil('\n'); l.trim();
+        refrescarPeriferia();
         if (!l.length()) continue;
         if (fila++ < saltar) continue;
         buf[n++] = l;
@@ -1428,6 +1516,7 @@ void handleLogs() {
         row += " <span class='muted'>(UID: " + uid + ")</span><br>"
                "<span class='ts'>&#128336; " + ts + "</span></div><hr>";
         servidor.sendContent(row);
+        refrescarPeriferia();
       }
       delete[] buf;
       servidor.sendContent("</div>");
@@ -1452,9 +1541,9 @@ void handleClearRegistros() {
   // Contar registros antes de borrar para el mensaje de confirmacion
   int totalLog = 0, totalEnt = 0;
   File f = LittleFS.open(ARCHIVO_LOG, "r");
-  if (f) { while (f.available()) { if (f.read() == '\n') totalLog++; } f.close(); }
+  if (f) { totalLog = contarLineas(f); f.close(); }
   f = LittleFS.open(ARCHIVO_ENT, "r");
-  if (f) { while (f.available()) { if (f.read() == '\n') totalEnt++; } f.close(); }
+  if (f) { totalEnt = contarLineas(f); f.close(); }
 
   limpiarRegistros();  // borra ambos archivos y resetea contadores NVS
   ledParpadear(LED_VERDE, LED_BLINK_N);
@@ -1511,6 +1600,7 @@ void handleEntradas() {
       int n = 0, fila = 0;
       while (f.available()) {
         String l = f.readStringUntil('\n'); l.trim();
+        refrescarPeriferia();
         if (!l.length()) continue;
         if (fila++ < saltar) continue;
         buf[n++] = l;
@@ -1544,6 +1634,7 @@ void handleEntradas() {
         bool existe = false;
         for (int j = 0; j < nu; j++) { if (uids[j] == uid) { existe = true; break; } }
         if (!existe) uids[nu++] = uid;
+        refrescarPeriferia();
       }
 
       for (int u = 0; u < nu; u++) {
@@ -1572,9 +1663,10 @@ void handleEntradas() {
                   "<span class='" + cls + "'>&#x25cf; " + tipo + "</span>"
                   " <span class='ts'>&#128336; " + ts + "</span>";
           }
-          if (codigo.length()) row += " <span class='muted'>[" + codigo + "]</span>";
+          if (codigo.length()) row += " <span class='muted'>[" + escapeHtml(codigo) + "]</span>";
           row += "</div>";
           servidor.sendContent(row);
+          refrescarPeriferia();
         }
         servidor.sendContent("</div>");
       }
@@ -2032,6 +2124,21 @@ void loop() {
     while (Serial2.available()) Serial2.read();
   }
 
+  // Auto-sanacion de la LCD: reinicializarla cada LCD_REFRESCO_INTERVALO ms,
+  // solo cuando esta en reposo (sin mensaje temporal en pantalla) para no
+  // interrumpir lo que se le este mostrando a alguien en ese momento.
+  if (ahora - lcdUltimoRefresco >= LCD_REFRESCO_INTERVALO) {
+    lcdUltimoRefresco = ahora;
+    if (!tiempoLcdHasta) {
+      lcd.init(); lcd.backlight(); lcdBacklightOn = true;
+      if      (esperandoTarjeta) lcdMostrar("Registrando:", nombrePendiente, "Acerca tarjeta", "");
+      else if (modoEliminar)     lcdMostrar("Modo eliminar", "Acerca tarjeta", "", "");
+      else                       lcdMostrar("Esperando", "tarjeta...", "", "");
+      lcdIdleDesde = ahora; lcdParpadeoNext = 0;
+      Serial.println("LCD: reinicializacion periodica preventiva");
+    }
+  }
+
   if (ahora - ultimaLecturaNfc < INTERVALO_NFC) return;
   ultimaLecturaNfc = ahora;
 
@@ -2063,6 +2170,9 @@ void loop() {
       tiempoLcdHasta = millis() + 3000; lcdPost = LCD_LISTO;
       ledFijar(LED_VERDE, 3000);
       matrizMostrar(PATRON_CHECK, CRGB::Green, 3000);
+      // Revertir el historial de esta tarjeta a NO_REGISTRADO/sin codigo,
+      // igual que quedaria una tarjeta que nunca se registro.
+      actualizarNombreHistorico(uid, "NO_REGISTRADO", "");
     }
     resultadoEliminacion = true; modoEliminar = false; return;
   }
@@ -2081,6 +2191,9 @@ void loop() {
     tiempoLcdHasta = millis() + 4000; lcdPost = LCD_LISTO;
     ledFijar(LED_VERDE, 4000);
     matrizMostrar(PATRON_CHECK, CRGB::Green, 4000);
+    // Actualizar lecturas viejas de esta tarjeta que hayan quedado como
+    // NO_REGISTRADO, para que muestren el nombre/codigo recien registrado.
+    actualizarNombreHistorico(uid, nombrePendiente, codigoPendiente);
     esperandoTarjeta = false; codigoPendiente = ""; nombrePendiente = ""; return;
   }
 

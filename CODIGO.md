@@ -392,6 +392,8 @@ El contador se incrementa **antes** de escribir, de modo que el valor guardado e
 
 **Reset explícito:** Al registrar una tarjeta, borrar un usuario, limpiar registros manualmente, o al cierre de día, el contador se pone a 0 explícitamente con `almacen.putInt(claveCont.c_str(), 0)`.
 
+**Consecuencia esperada del reset al registrar/borrar:** como el contador vuelve a 0 en ambos casos, el toque **siguiente** siempre cuenta como Entrada — sin importar que esa misma tarjeta, sin registrar, ya hubiera marcado "Entrada" justo antes de registrarla. No es un caso borde ni un bug: los toques dados antes del registro (o después del borrado) no pertenecen al ciclo Entrada/Salida de esa persona, así que no deben "arrastrar" paridad hacia el nuevo estado.
+
 ---
 
 ## Secuencia de recuperación del UART del PN532

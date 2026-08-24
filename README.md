@@ -234,12 +234,18 @@ Todas las rutas son accesibles desde `http://192.168.4.1`.
 3. Acercar la tarjeta NFC al lector. El sistema guarda el UID con el nombre y código.
 4. La web redirige automáticamente a la página de confirmación.
 
+> Registrar una tarjeta **reinicia su contador de Entrada/Salida a 0**, sin importar los toques que haya tenido antes (registrada o no). Esto significa que el primer toque **después** de registrarla siempre se cuenta como **Entrada**, aunque justo antes de registrarla ya hubiera marcado "Entrada" como tarjeta sin registrar — es el comportamiento esperado: los toques previos al registro no cuentan para el ciclo de esa persona.
+>
+> Además, todas las líneas viejas de esa tarjeta en `/logs` y `/entradas` que decían `NO_REGISTRADO` se actualizan automáticamente para mostrar el nombre y código recién puestos (ver [Comportamiento ante cortes de alimentación](#comportamiento-ante-cortes-de-alimentación) más abajo para el detalle del dato guardado por tarjeta).
+
 ### Proceso de borrado de usuario
 
 1. Ir a `/register` → "Borrar usuario con tarjeta".
 2. La LCD muestra "Modo eliminar / Acerca tarjeta".
 3. Acercar la tarjeta del usuario a borrar. El sistema elimina el registro de NVS y de LittleFS.
 4. Si la tarjeta no está registrada, la web informa "Tarjeta no registrada".
+
+> Borrar una tarjeta también **elimina su contador de Entrada/Salida**, así que si se vuelve a usar (ahora sin registrar) o se registra de nuevo más adelante, arranca otra vez desde cero y el próximo toque vuelve a ser Entrada. Además, todas sus líneas viejas en `/logs` y `/entradas` vuelven a mostrar `NO_REGISTRADO` sin código — los eventos en sí (fecha, tipo) no se borran, solo el nombre/código que mostraban.
 
 ---
 
@@ -318,6 +324,8 @@ Por cada usuario, el sistema mantiene en NVS:
 - `f<UID>` — fecha del último acceso en formato `YYYY-MM-DD`
 
 Esta información permite detectar correctamente si hubo una Entrada sin Salida al cruzar la medianoche, aunque el ESP32 haya estado apagado.
+
+> **`c<UID>` se resetea a 0 al registrar o al borrar la tarjeta**, sin importar en qué iba antes. Por eso el primer toque después de registrar (o de volver a usar una tarjeta recién borrada) siempre cuenta como Entrada — es intencional, no un error: los toques que dio la tarjeta antes de tener (o después de perder) su registro no forman parte del ciclo Entrada/Salida de esa persona.
 
 ---
 
