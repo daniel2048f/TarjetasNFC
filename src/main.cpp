@@ -750,8 +750,9 @@ void actualizarNombreHistorico(const String& uid, const String& nuevoNombre, con
       }
       foutLog.close();
       finLog.close();
-      LittleFS.remove(ARCHIVO_LOG);
-      LittleFS.rename(ARCHIVO_LOG_TMP, ARCHIVO_LOG);
+      if (!LittleFS.remove(ARCHIVO_LOG) || !LittleFS.rename(ARCHIVO_LOG_TMP, ARCHIVO_LOG)) {
+        Serial.println("HISTORICO: ADVERTENCIA - fallo al reemplazar " ARCHIVO_LOG);
+      }
     } else {
       finLog.close();
       Serial.println("HISTORICO: no se pudo abrir " ARCHIVO_LOG_TMP ", logs.txt no actualizado");
@@ -775,14 +776,81 @@ void actualizarNombreHistorico(const String& uid, const String& nuevoNombre, con
       }
       foutEnt.close();
       finEnt.close();
-      LittleFS.remove(ARCHIVO_ENT);
-      LittleFS.rename(ARCHIVO_ENT_TMP, ARCHIVO_ENT);
+      if (!LittleFS.remove(ARCHIVO_ENT) || !LittleFS.rename(ARCHIVO_ENT_TMP, ARCHIVO_ENT)) {
+        Serial.println("HISTORICO: ADVERTENCIA - fallo al reemplazar " ARCHIVO_ENT);
+      }
     } else {
       finEnt.close();
       Serial.println("HISTORICO: no se pudo abrir " ARCHIVO_ENT_TMP ", entradas.txt no actualizado");
     }
   }
   Serial.println("HISTORICO: " + uid + " -> nombre/codigo actualizado en logs.txt/entradas.txt");
+}
+
+// Resincroniza TODO el historial de una sola pasada: para cada linea de
+// ARCHIVO_LOG/ARCHIVO_ENT, vuelve a consultar en NVS el nombre/codigo ACTUAL
+// del UID de esa linea (o "NO_REGISTRADO"/"" si ya no esta registrado) y lo
+// reescribe. A diferencia de actualizarNombreHistorico() (que solo toca un
+// UID), esto corrige de una vez cualquier desajuste que haya quedado de
+// registros/borrados hechos ANTES de que existiera la actualizacion
+// automatica — por ejemplo, tarjetas registradas con un firmware anterior a
+// este cambio, cuyo historial viejo se quedo diciendo NO_REGISTRADO para
+// siempre porque esa version del firmware nunca lo corregia.
+void resincronizarHistorico() {
+  File finLog = LittleFS.open(ARCHIVO_LOG, "r");
+  if (finLog) {
+    File foutLog = LittleFS.open(ARCHIVO_LOG_TMP, "w");
+    if (foutLog) {
+      while (finLog.available()) {
+        String l = finLog.readStringUntil('\n'); l.trim();
+        refrescarPeriferia();
+        if (!l.length()) continue;
+        String ts, u, nombre, codigo;
+        if (logParsear(l, ts, u, nombre, codigo)) {
+          String nombreActual = almacen.getString(u.c_str(), "NO_REGISTRADO");
+          String codigoActual = (nombreActual == "NO_REGISTRADO") ? "" : almacen.getString(("k" + u).c_str(), "");
+          foutLog.println(ts + "|" + u + "|" + nombreActual + "|" + codigoActual);
+        } else {
+          foutLog.println(l);
+        }
+      }
+      foutLog.close();
+      finLog.close();
+      if (!LittleFS.remove(ARCHIVO_LOG) || !LittleFS.rename(ARCHIVO_LOG_TMP, ARCHIVO_LOG)) {
+        Serial.println("RESYNC: ADVERTENCIA - fallo al reemplazar " ARCHIVO_LOG);
+      }
+    } else {
+      finLog.close();
+    }
+  }
+
+  File finEnt = LittleFS.open(ARCHIVO_ENT, "r");
+  if (finEnt) {
+    File foutEnt = LittleFS.open(ARCHIVO_ENT_TMP, "w");
+    if (foutEnt) {
+      while (finEnt.available()) {
+        String l = finEnt.readStringUntil('\n'); l.trim();
+        refrescarPeriferia();
+        if (!l.length()) continue;
+        String ts, u, nombre, codigo, tipo;
+        if (entradaParsear(l, ts, u, nombre, codigo, tipo)) {
+          String nombreActual = almacen.getString(u.c_str(), "NO_REGISTRADO");
+          String codigoActual = (nombreActual == "NO_REGISTRADO") ? "" : almacen.getString(("k" + u).c_str(), "");
+          foutEnt.println(ts + "|" + u + "|" + nombreActual + "|" + codigoActual + "|" + tipo);
+        } else {
+          foutEnt.println(l);
+        }
+      }
+      foutEnt.close();
+      finEnt.close();
+      if (!LittleFS.remove(ARCHIVO_ENT) || !LittleFS.rename(ARCHIVO_ENT_TMP, ARCHIVO_ENT)) {
+        Serial.println("RESYNC: ADVERTENCIA - fallo al reemplazar " ARCHIVO_ENT);
+      }
+    } else {
+      finEnt.close();
+    }
+  }
+  Serial.println("RESYNC: historico de logs.txt/entradas.txt resincronizado con NVS");
 }
 
 // ── Usuarios (ARCHIVO_UIDS + NVS) ────────────────────────────
@@ -1699,7 +1767,24 @@ void handleUsuarios() {
     "<h2>&#128101; Usuarios registrados</h2>" + usuariosHtml() +
     "<div style='margin:20px 0;display:flex;flex-wrap:wrap;gap:8px'>"
     "<a href='/'><button>Volver</button></a> "
-    "<a href='/downloadUsuarios'><button class='btn-ok'>&#128229; Descargar CSV</button></a></div>"));
+    "<a href='/downloadUsuarios'><button class='btn-ok'>&#128229; Descargar CSV</button></a> "
+    "<a href='/resincronizarHistorico' onclick='return confirm(\"Esto revisa logs.txt y entradas.txt "
+    "completos y corrige el nombre/codigo de cada linea segun el registro actual. Puede tardar unos "
+    "segundos con historiales grandes. Continuar?\");'>"
+    "<button class='btn-email'>&#128260; Resincronizar nombres</button></a></div>"
+    "<p class='muted'>Usa \"Resincronizar nombres\" si algun usuario registrado hace tiempo sigue "
+    "apareciendo como NO_REGISTRADO en /logs o /entradas.</p>"));
+}
+
+void handleResincronizarHistorico() {
+  resincronizarHistorico();
+  servidor.send(200, "text/html", pagina("Historico resincronizado",
+    "<h2>&#10003; Historico resincronizado</h2><div class='card'>"
+    "<p>Se revisaron logs.txt y entradas.txt y se actualizo el nombre/codigo de cada linea "
+    "segun el registro actual de cada tarjeta.</p>"
+    "<a href='/logs'><button>Ver logs</button></a> "
+    "<a href='/entradas'><button>Ver entradas</button></a> "
+    "<a href='/usuarios'><button>Volver</button></a></div>"));
 }
 
 void handleDownloadUsuarios() {
@@ -2001,6 +2086,18 @@ void setup() {
   LittleFS.begin(true);
   reconstruirArchivoUids();  // sincronizar ARCHIVO_UIDS con NVS en cada arranque
 
+  // Resincronizacion historica de una sola vez: corrige tarjetas registradas
+  // o borradas con un firmware anterior a actualizarNombreHistorico(), cuyo
+  // historial en logs.txt/entradas.txt se quedo diciendo NO_REGISTRADO para
+  // siempre porque esa version nunca lo actualizaba. Solo corre la primera
+  // vez que arranca este firmware (bandera en NVS); despues el registro y
+  // el borrado mantienen todo sincronizado por su cuenta.
+  if (!almacen.getBool("histSyncV1", false)) {
+    Serial.println("RESYNC: primera vez con esta version, resincronizando historico...");
+    resincronizarHistorico();
+    almacen.putBool("histSyncV1", true);
+  }
+
   // ── RTC ──────────────────────────────────────────────────────────────────────
   busRtc.begin(RTC_SDA, RTC_SCL); delay(50);
   rtcDisponible = rtcDs3231.begin(&busRtc);
@@ -2051,6 +2148,7 @@ void setup() {
   servidor.on("/clearRegistros",   handleClearRegistros);
   servidor.on("/usuarios",         handleUsuarios);
   servidor.on("/downloadUsuarios", handleDownloadUsuarios);
+  servidor.on("/resincronizarHistorico", handleResincronizarHistorico);
   servidor.on("/config",           handleConfig);
   servidor.on("/saveConfig",       HTTP_POST, handleSaveConfig);
   servidor.on("/sendEmail",           handleSendEmail);

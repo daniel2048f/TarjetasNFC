@@ -16,11 +16,12 @@ Referencia para desarrolladores que lean, entiendan o modifiquen `src/main.cpp`.
 8. [Anti-rebote y cooldown de tarjetas](#anti-rebote-y-cooldown-de-tarjetas)
 9. [Por qué existe ARCHIVO_UIDS además de NVS](#por-qué-existe-archivo_uids-además-de-nvs)
 10. [Lógica par/impar para entradas y salidas](#lógica-parimpar-para-entradas-y-salidas)
-11. [Secuencia de recuperación del UART del PN532](#secuencia-de-recuperación-del-uart-del-pn532)
-12. [Consideraciones del DS3231 con RTClib](#consideraciones-del-ds3231-con-rtclib)
-13. [Decisiones de diseño no obvias](#decisiones-de-diseño-no-obvias)
-14. [Diagrama de flujo del programa (para todos)](#diagrama-de-flujo-del-programa-para-todos)
-15. [Glosario técnico](#glosario-técnico)
+11. [Actualización retroactiva de nombre/código en el historial](#actualización-retroactiva-de-nombrecódigo-en-el-historial)
+12. [Secuencia de recuperación del UART del PN532](#secuencia-de-recuperación-del-uart-del-pn532)
+13. [Consideraciones del DS3231 con RTClib](#consideraciones-del-ds3231-con-rtclib)
+14. [Decisiones de diseño no obvias](#decisiones-de-diseño-no-obvias)
+15. [Diagrama de flujo del programa (para todos)](#diagrama-de-flujo-del-programa-para-todos)
+16. [Glosario técnico](#glosario-técnico)
 
 ---
 
@@ -393,6 +394,27 @@ El contador se incrementa **antes** de escribir, de modo que el valor guardado e
 **Reset explícito:** Al registrar una tarjeta, borrar un usuario, limpiar registros manualmente, o al cierre de día, el contador se pone a 0 explícitamente con `almacen.putInt(claveCont.c_str(), 0)`.
 
 **Consecuencia esperada del reset al registrar/borrar:** como el contador vuelve a 0 en ambos casos, el toque **siguiente** siempre cuenta como Entrada — sin importar que esa misma tarjeta, sin registrar, ya hubiera marcado "Entrada" justo antes de registrarla. No es un caso borde ni un bug: los toques dados antes del registro (o después del borrado) no pertenecen al ciclo Entrada/Salida de esa persona, así que no deben "arrastrar" paridad hacia el nuevo estado.
+
+---
+
+## Actualización retroactiva de nombre/código en el historial
+
+`logs.txt` y `entradas.txt` guardan el nombre y el código **inline en cada línea** (no una referencia al UID que se resuelva contra NVS al mostrarla). Esto es simple y rápido de leer, pero significa que si el nombre de una tarjeta cambia (se registra o se borra), las líneas ya escritas no se enteran solas — hay que reescribirlas.
+
+### `actualizarNombreHistorico(uid, nuevoNombre, nuevoCodigo)`
+
+Se llama en `loop()` en el mismo instante en que se registra o se borra una tarjeta (después de guardar/borrar en NVS, para no demorar la confirmación en LCD/LED/matriz). Reescribe `ARCHIVO_LOG` y `ARCHIVO_ENT` línea por línea a un archivo temporal (`ARCHIVO_LOG_TMP`/`ARCHIVO_ENT_TMP`), reemplazando nombre y código **solo** en las líneas cuyo UID coincide, dejando timestamp y tipo (Entrada/Salida) intactos. Al terminar, borra el original y renombra el temporal en su lugar — y ahora **sí verifica el resultado** de `LittleFS.remove()`/`LittleFS.rename()` (antes se ignoraba, igual que en `limpiarRegistros()` antes de corregirlo).
+
+- Al **registrar**: se llama con el nombre/código recién puestos, así las líneas viejas que decían `NO_REGISTRADO` pasan a mostrar la identidad real.
+- Al **borrar**: se llama con `"NO_REGISTRADO"` y `""`, revirtiendo el historial de esa tarjeta al estado de "nunca registrada".
+
+### `resincronizarHistorico()` — reparación masiva de una sola pasada
+
+Este mecanismo de actualización recién se agregó; cualquier registro o borrado hecho con una versión de firmware **anterior** a este cambio nunca disparó `actualizarNombreHistorico()`, así que esas tarjetas se quedaron con el historial viejo diciendo `NO_REGISTRADO` para siempre — el síntoma reportado en producción fue justo ese: una tarjeta registrada hace tiempo que seguía apareciendo sin registrar en `/entradas`.
+
+`resincronizarHistorico()` corrige esto de una vez: en una sola pasada por cada archivo, para **cada línea** vuelve a consultar en NVS el nombre/código *actual* del UID de esa línea (`almacen.getString(uid, "NO_REGISTRADO")`) y lo reescribe. A diferencia de recorrer todos los UIDs registrados y llamar `actualizarNombreHistorico()` una vez por cada uno (que sería O(usuarios × tamaño de archivo) — potencialmente muy lento con muchos usuarios), esto es una sola pasada O(tamaño de archivo) sin importar cuántos usuarios haya.
+
+Se dispara automáticamente **una única vez**, en `setup()`, la primera vez que arranca un firmware que incluye este mecanismo (bandera `histSyncV1` en NVS — una vez puesta a `true`, nunca se vuelve a correr sola). También está expuesta a mano en `/resincronizarHistorico` (botón "🔄 Resincronizar nombres" en `/usuarios`) por si hace falta forzarla de nuevo más adelante.
 
 ---
 

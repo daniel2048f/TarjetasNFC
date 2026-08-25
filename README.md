@@ -220,6 +220,7 @@ Todas las rutas son accesibles desde `http://192.168.4.1`.
 | `/clearRegistros`   | GET    | Borra todos los registros (logs + entradas/salidas) y resetea contadores   |
 | `/usuarios`         | GET    | Lista de todos los usuarios registrados                                    |
 | `/downloadUsuarios` | GET    | Descarga la lista de usuarios en formato CSV                               |
+| `/resincronizarHistorico` | GET | Reescribe logs.txt/entradas.txt con el nombre/código actual de cada tarjeta |
 | `/config`           | GET    | Página de configuración (WiFi, email, zona horaria)                        |
 | `/saveConfig`       | POST   | Guarda la configuración y reconecta el WiFi                                |
 | `/sendEmail`             | GET    | Envía manualmente un correo con todos los registros adjuntos               |
@@ -237,6 +238,8 @@ Todas las rutas son accesibles desde `http://192.168.4.1`.
 > Registrar una tarjeta **reinicia su contador de Entrada/Salida a 0**, sin importar los toques que haya tenido antes (registrada o no). Esto significa que el primer toque **después** de registrarla siempre se cuenta como **Entrada**, aunque justo antes de registrarla ya hubiera marcado "Entrada" como tarjeta sin registrar — es el comportamiento esperado: los toques previos al registro no cuentan para el ciclo de esa persona.
 >
 > Además, todas las líneas viejas de esa tarjeta en `/logs` y `/entradas` que decían `NO_REGISTRADO` se actualizan automáticamente para mostrar el nombre y código recién puestos (ver [Comportamiento ante cortes de alimentación](#comportamiento-ante-cortes-de-alimentación) más abajo para el detalle del dato guardado por tarjeta).
+>
+> **Registros hechos con una versión de firmware anterior a esta actualización automática** se quedaron con el nombre viejo (`NO_REGISTRADO`) sin corregir, porque esa versión no tenía esta lógica. La primera vez que arranca este firmware, el sistema **corrige esto solo, una única vez**, revisando y actualizando todo el historial. Si más adelante alguna tarjeta registrada hace tiempo sigue apareciendo como `NO_REGISTRADO`, entrar a `/usuarios` y usar el botón **"🔄 Resincronizar nombres"** lo corrige a mano en cualquier momento.
 
 ### Proceso de borrado de usuario
 
