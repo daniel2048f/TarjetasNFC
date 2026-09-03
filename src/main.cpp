@@ -446,9 +446,15 @@ int ultimoDiaDelMes(int mes, int anio) {
 // ── HTML ─────────────────────────────────────────────────────
 // Banner de alerta cuando el auto-envio de correo fallo en ambas ventanas del dia.
 // Se inserta al inicio del body en todas las paginas mientras la bandera este activa.
+// Umbral de aviso visible (mas generoso que LITTLEFS_MARGEN_MIN, que es el
+// limite duro que bloquea escrituras): avisa con margen antes de llegar a
+// ese punto, para poder borrar registros a tiempo desde la web.
+const size_t LITTLEFS_MARGEN_AVISO = 16384;  // 16 KB
+
 String bannerAlerta() {
-  if (!emailPendienteFlag) return "";
-  return "<div style='background:#fff3cd;border:2px solid #e6a817;border-radius:8px;"
+  String r = "";
+  if (emailPendienteFlag) {
+    r += "<div style='background:#fff3cd;border:2px solid #e6a817;border-radius:8px;"
          "padding:14px 16px;margin:0 0 16px 0'>"
          "<b>&#9888; Correo con logs no enviado y archivos no eliminados de memoria. "
          "Por favor desc&aacute;rgalos y borra la memoria manualmente.</b> "
@@ -457,6 +463,17 @@ String bannerAlerta() {
          "<button style='background:#28a745;color:white;font-weight:bold;padding:8px 14px;"
          "border:none;border-radius:6px;cursor:pointer'>&#10003; Confirmar</button>"
          "</a></div>";
+  }
+  if (LittleFS.totalBytes() - LittleFS.usedBytes() < LITTLEFS_MARGEN_AVISO) {
+    r += "<div style='background:#f8d7da;border:2px solid #dc3545;border-radius:8px;"
+         "padding:14px 16px;margin:0 0 16px 0'>"
+         "<b>&#9888; Memoria casi llena.</b> Si se llena por completo, dejan de guardarse "
+         "eventos nuevos. Descarga los CSV y borra los registros pronto. "
+         "<a href='/logs'><button style='background:#dc3545;color:white;font-weight:bold;"
+         "padding:8px 14px;border:none;border-radius:6px;cursor:pointer'>Ir a /logs</button></a>"
+         "</div>";
+  }
+  return r;
 }
 
 const char ESTILOS[] =
@@ -506,8 +523,29 @@ String escapeHtml(const String& s) {
   return r;
 }
 
+// La particion de LittleFS de este proyecto (min_spiffs.csv) es de solo
+// 128 KB. Sin este resguardo, si se llena por completo (historial nunca
+// borrado durante meses), la propia libreria LittleFS puede fallar
+// internamente al intentar asignar un nuevo bloque (division por cero en su
+// asignador) en vez de devolver un error limpio — tumbando el ESP32 en cada
+// intento de escritura, incluido cerrarDiaArranque() en cada arranque
+// (bucle de reinicio del que no se puede salir sin desconectar el cable).
+const size_t LITTLEFS_MARGEN_MIN = 8192;  // 8 KB de colchon minimo
+bool espacioLittleFsSuficiente() {
+  return (LittleFS.totalBytes() - LittleFS.usedBytes()) >= LITTLEFS_MARGEN_MIN;
+}
+// Para operaciones que reescriben un archivo a un temporal (necesitan el
+// original + la copia coexistiendo un momento, casi el doble del tamano).
+bool espacioLittleFsSuficientePara(size_t bytesAdicionales) {
+  return (LittleFS.totalBytes() - LittleFS.usedBytes()) >= bytesAdicionales + LITTLEFS_MARGEN_MIN;
+}
+
 // ── Logs de acceso (LittleFS) ─────────────────────────────────
 void logAgregar(const String& ts, const String& uid, const String& nombre, const String& codigo) {
+  if (!espacioLittleFsSuficiente()) {
+    Serial.println("LOG: espacio insuficiente en LittleFS, escritura omitida");
+    return;
+  }
   File f = LittleFS.open(ARCHIVO_LOG, "a");
   if (f) { f.println(ts + "|" + uid + "|" + nombre + "|" + codigo); f.close(); }
 }
@@ -619,6 +657,10 @@ String logCsv() {
 // ── Entradas / Salidas (LittleFS) ────────────────────────────
 void entradaAgregar(const String& ts, const String& uid, const String& nombre,
                     const String& codigo, const String& tipo) {
+  if (!espacioLittleFsSuficiente()) {
+    Serial.println("ENTRADA: espacio insuficiente en LittleFS, escritura omitida");
+    return;
+  }
   File f = LittleFS.open(ARCHIVO_ENT, "a");
   if (f) { f.println(ts + "|" + uid + "|" + nombre + "|" + codigo + "|" + tipo); f.close(); }
 }
@@ -746,6 +788,11 @@ String entradaCsv() {
 // completo en RAM) y al final reemplaza el archivo original.
 void actualizarNombreHistorico(const String& uid, const String& nuevoNombre, const String& nuevoCodigo) {
   File finLog = LittleFS.open(ARCHIVO_LOG, "r");
+  if (finLog && !espacioLittleFsSuficientePara(finLog.size())) {
+    Serial.println("HISTORICO: espacio insuficiente en LittleFS, logs.txt no actualizado");
+    finLog.close();
+    finLog = File();
+  }
   if (finLog) {
     File foutLog = LittleFS.open(ARCHIVO_LOG_TMP, "w");
     if (foutLog) {
@@ -772,6 +819,11 @@ void actualizarNombreHistorico(const String& uid, const String& nuevoNombre, con
   }
 
   File finEnt = LittleFS.open(ARCHIVO_ENT, "r");
+  if (finEnt && !espacioLittleFsSuficientePara(finEnt.size())) {
+    Serial.println("HISTORICO: espacio insuficiente en LittleFS, entradas.txt no actualizado");
+    finEnt.close();
+    finEnt = File();
+  }
   if (finEnt) {
     File foutEnt = LittleFS.open(ARCHIVO_ENT_TMP, "w");
     if (foutEnt) {
@@ -825,9 +877,8 @@ void resincronizarHistorico() {
   // en vez de consultar NVS (memoria flash, con costo real por lectura) por
   // cada linea del historial. Con miles de lineas acumuladas y solo unas
   // decenas/cientos de usuarios, consultar NVS linea por linea multiplicaba
-  // el trabajo de forma innecesaria y podia tardar tanto que disparaba el
-  // watchdog del sistema durante el arranque — causa real de un reinicio en
-  // bucle mostrando "Sistema NFC / Iniciando..." detectado en produccion.
+  // el trabajo de forma innecesaria y ademas es mas rapido y genera menos
+  // desgaste de flash.
   File fu = LittleFS.open(ARCHIVO_UIDS, "r");
   int nUids = 0;
   if (fu) { nUids = contarLineas(fu); fu.seek(0); }
@@ -851,6 +902,11 @@ void resincronizarHistorico() {
   }
 
   File finLog = LittleFS.open(ARCHIVO_LOG, "r");
+  if (finLog && !espacioLittleFsSuficientePara(finLog.size())) {
+    Serial.println("RESYNC: espacio insuficiente en LittleFS, logs.txt no resincronizado");
+    finLog.close();
+    finLog = File();
+  }
   if (finLog) {
     File foutLog = LittleFS.open(ARCHIVO_LOG_TMP, "w");
     if (foutLog) {
@@ -878,6 +934,11 @@ void resincronizarHistorico() {
   }
 
   File finEnt = LittleFS.open(ARCHIVO_ENT, "r");
+  if (finEnt && !espacioLittleFsSuficientePara(finEnt.size())) {
+    Serial.println("RESYNC: espacio insuficiente en LittleFS, entradas.txt no resincronizado");
+    finEnt.close();
+    finEnt = File();
+  }
   if (finEnt) {
     File foutEnt = LittleFS.open(ARCHIVO_ENT_TMP, "w");
     if (foutEnt) {
@@ -1236,7 +1297,7 @@ bool enviarEmail(const String& csvLog, const String& csvEntradas,
         almacen.putBool("emailPend", false);
       }
       if (borrarTras) {
-        limpiarRegistros();  // solo dias 10, 20 y ultimo del mes
+        limpiarRegistros();  // solo dias pares del mes (2, 4, 6, ...)
         Serial.println("EMAIL-AUTO: registros borrados y contadores reseteados.");
       }
       Serial.println("EMAIL-AUTO: lastEmail actualizado.");
@@ -1384,7 +1445,11 @@ void autoEnviarEmail() {
   FechaHora fh = rtcLeerFechaHora();
   int ud = ultimoDiaDelMes(fh.mes, fh.anio);
   char hoy[11]; snprintf(hoy, sizeof(hoy), "%04d-%02d-%02d", fh.anio, fh.mes, fh.dia);
-  bool esDiaLimpieza = (fh.dia == 10 || fh.dia == 20 || fh.dia == ud);
+  // Dia de limpieza = todos los dias pares del mes (2, 4, 6, ... 30). Antes
+  // era solo 10, 20 y el ultimo del mes; se cambio a cada 2 dias para que la
+  // memoria nunca vuelva a acumularse lo suficiente como para llenar la
+  // particion de LittleFS (128 KB) como paso en produccion.
+  bool esDiaLimpieza = (fh.dia % 2 == 0);
   String lastEmail = almacen.getString("lastEmail", "");
 
   // ── Deteccion de envio perdido en dias anteriores ─────────────
@@ -1492,8 +1557,11 @@ void handleSaveName() {
   }
   // "|" es el separador de campos en logs.txt/entradas.txt: si el nombre lo
   // contuviera, corromperia el formato de TODAS sus lineas de historial.
-  if (nombrePendiente.indexOf('|') >= 0) {
-    servidor.send(400, "text/plain", "El nombre no puede contener el caracter '|'"); return;
+  // La coma tambien se bloquea porque usuariosCsv() (y su reverso, la
+  // importacion masiva en /importarUsuarios) usa "," como separador de
+  // columnas sin comillas.
+  if (nombrePendiente.indexOf('|') >= 0 || nombrePendiente.indexOf(',') >= 0) {
+    servidor.send(400, "text/plain", "El nombre no puede contener los caracteres '|' ni ','"); return;
   }
   // El codigo se valida server-side (antes solo el HTML del formulario lo
   // restringia a [A-Za-z0-9], lo cual un cliente distinto al navegador podia
@@ -1825,12 +1893,140 @@ void handleUsuarios() {
     "<div style='margin:20px 0;display:flex;flex-wrap:wrap;gap:8px'>"
     "<a href='/'><button>Volver</button></a> "
     "<a href='/downloadUsuarios'><button class='btn-ok'>&#128229; Descargar CSV</button></a> "
+    "<a href='/importarUsuarios'><button class='btn-email'>&#128228; Importar usuarios</button></a> "
     "<a href='/resincronizarHistorico' onclick='return confirm(\"Esto revisa logs.txt y entradas.txt "
     "completos y corrige el nombre/codigo de cada linea segun el registro actual. Puede tardar unos "
     "segundos con historiales grandes. Continuar?\");'>"
     "<button class='btn-email'>&#128260; Resincronizar nombres</button></a></div>"
     "<p class='muted'>Usa \"Resincronizar nombres\" si algun usuario registrado hace tiempo sigue "
     "apareciendo como NO_REGISTRADO en /logs o /entradas.</p>"));
+
+  // ── Boton "Borrar TODAS las tarjetas" OCULTO ───────────────────────────
+  // Se quito de la interfaz a pedido. La ruta /borrarTodosUsuarios sigue
+  // registrada y funcionando (se puede invocar escribiendo la URL a mano);
+  // aqui solo se oculto el boton y su texto. El borrado individual acercando
+  // la tarjeta (en /register) no se toco.
+  //
+  // Para volver a mostrarlo: descomentar el bloque de abajo, reinsertarlo en
+  // la concatenacion de arriba (antes del "));") y restaurar el conteo:
+  //
+  //   int totalUsuarios = 0;
+  //   File fc = LittleFS.open(ARCHIVO_UIDS, "r");
+  //   if (fc) { totalUsuarios = contarLineas(fc); fc.close(); }
+  //
+  //   "<div class='card' style='border-color:#dc3545'>"
+  //   "<h3 style='color:#dc3545'>&#9888; Borrar todas las tarjetas</h3>"
+  //   "<p class='muted'>Elimina TODAS las tarjetas registradas (" + String(totalUsuarios) + " actualmente) "
+  //   "sin necesidad de acercarlas una por una. El historial de logs/entradas vuelve a mostrar "
+  //   "NO_REGISTRADO para todas. Para borrar una sola tarjeta puntual, segui usando "
+  //   "\"Borrar usuario con tarjeta\" en /register.</p>"
+  //   "<a href='/borrarTodosUsuarios' onclick='return confirm(\"Esto borra las " + String(totalUsuarios) + " "
+  //   "tarjetas registradas actualmente. Esta accion NO se puede deshacer. Si queres conservarlas, "
+  //   "descarga el CSV primero. Continuar?\");'>"
+  //   "<button class='btn-danger'>&#128465; Borrar TODAS las tarjetas</button></a></div>"
+}
+
+void handleBorrarTodosUsuarios() {
+  int totalBorrados = 0;
+  File f = LittleFS.open(ARCHIVO_UIDS, "r");
+  if (f) {
+    while (f.available()) {
+      String uid = f.readStringUntil('\n'); uid.trim();
+      refrescarPeriferia();
+      if (!uid.length()) continue;
+      String nombre = almacen.getString(uid.c_str(), "");
+      if (!nombre.length()) continue;
+      almacen.remove(uid.c_str());
+      almacen.remove(("k" + uid).c_str());
+      almacen.remove(("c" + uid).c_str());
+      almacen.remove(("f" + uid).c_str());
+      totalBorrados++;
+    }
+    f.close();
+  }
+  File fout = LittleFS.open(ARCHIVO_UIDS, "w");
+  if (fout) fout.close();
+  // Una sola resincronizacion al final (no una por tarjeta borrada): revisa
+  // logs.txt/entradas.txt de una pasada y deja NO_REGISTRADO en todo lo que
+  // ya no tiene dueno en NVS.
+  resincronizarHistorico();
+  ledParpadear(LED_VERDE, LED_BLINK_N);
+  matrizMostrar(PATRON_CHECK, CRGB::Green, 3000);
+  Serial.printf("USUARIOS: %d tarjetas borradas masivamente (sin tarjeta fisica)\n", totalBorrados);
+  servidor.send(200, "text/html", pagina("Usuarios borrados",
+    "<h2>&#10003; Todas las tarjetas fueron borradas</h2><div class='card'>"
+    "<p>Se eliminaron <b>" + String(totalBorrados) + "</b> tarjetas registradas.</p>"
+    "<p class='muted'>El historial de logs/entradas quedo actualizado: ya no aparecen como "
+    "registradas.</p>"
+    "<a href='/usuarios'><button>Volver</button></a> "
+    "<a href='/'><button>Inicio</button></a></div>"));
+}
+
+// ── Importacion masiva de usuarios (sin necesidad de acercar tarjetas) ──
+// Formato esperado: el mismo CSV que exporta /downloadUsuarios
+// (UID,Nombre,Codigo por linea, con o sin encabezado). Pensado sobre todo
+// para restaurar usuarios despues de un borrado completo de flash (p.ej.
+// al migrar a una tabla de particiones nueva), sin tener que volver a
+// acercar cada tarjeta fisica una por una.
+void handleImportarUsuariosForm() {
+  servidor.send(200, "text/html", pagina("Importar usuarios",
+    "<h2>&#128228; Importar usuarios desde CSV</h2><div class='card'>"
+    "<p class='muted'>Pega aqui el CSV exportado desde \"Descargar CSV\" en /usuarios "
+    "(formato: UID,Nombre,Codigo, una tarjeta por linea). Sirve para restaurar usuarios sin "
+    "volver a acercar cada tarjeta al lector.</p>"
+    "<form method='POST' action='/importarUsuarios'>"
+    "<textarea name='csv' rows='12' style='width:100%;font-family:monospace;font-size:13px;"
+    "box-sizing:border-box' placeholder='UID,Nombre,Codigo&#10;04211176D42A81,Juan Perez,AB12'>"
+    "</textarea><br><br>"
+    "<button type='submit'>Importar</button></form></div>"
+    "<a href='/usuarios'><button>Volver</button></a>"));
+}
+
+void handleImportarUsuarios() {
+  if (!servidor.hasArg("csv")) { servidor.send(400, "text/plain", "Falta el CSV"); return; }
+  String csv = servidor.arg("csv");
+  int pos = 0, importados = 0, omitidos = 0;
+  while (pos < (int)csv.length()) {
+    refrescarPeriferia();
+    int fin = csv.indexOf('\n', pos);
+    String linea = (fin < 0) ? csv.substring(pos) : csv.substring(pos, fin);
+    pos = (fin < 0) ? csv.length() : fin + 1;
+    linea.trim();
+    if (!linea.length()) continue;
+    if (linea.startsWith("UID,") || linea.startsWith("uid,")) continue;  // encabezado del CSV
+
+    int c1 = linea.indexOf(','), c2 = (c1 >= 0) ? linea.indexOf(',', c1 + 1) : -1;
+    if (c1 < 0 || c2 < 0) { omitidos++; continue; }
+    String uid    = linea.substring(0, c1); uid.trim(); uid.toUpperCase();
+    String nombre = linea.substring(c1 + 1, c2); nombre.trim();
+    String codigo = linea.substring(c2 + 1); codigo.trim();
+
+    bool uidValido = uid.length() >= 6 && uid.length() <= 14;
+    for (int i = 0; uidValido && i < (int)uid.length(); i++) {
+      char c = uid[i];
+      if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) uidValido = false;
+    }
+    bool nombreValido = nombre.length() > 0 && nombre.indexOf('|') < 0 && nombre.indexOf(',') < 0;
+    bool codigoValido = codigo.length() > 0 && codigo.length() <= 6;
+    for (int i = 0; codigoValido && i < (int)codigo.length(); i++) {
+      if (!isalnum((unsigned char)codigo[i])) codigoValido = false;
+    }
+    if (!uidValido || !nombreValido || !codigoValido) { omitidos++; continue; }
+
+    almacen.putString(uid.c_str(), nombre);
+    almacen.putString(("k" + uid).c_str(), codigo);
+    almacen.putInt(("c" + uid).c_str(), 0);
+    uidRegistrar(uid);
+    importados++;
+  }
+  resincronizarHistorico();
+  Serial.printf("IMPORTAR: %d usuarios importados, %d omitidos por formato invalido\n", importados, omitidos);
+  servidor.send(200, "text/html", pagina("Usuarios importados",
+    "<h2>&#10003; Importacion completada</h2><div class='card'>"
+    "<p>Importados: <b>" + String(importados) + "</b></p>"
+    "<p>Omitidos por formato invalido: <b>" + String(omitidos) + "</b></p>"
+    "<a href='/usuarios'><button>Ver usuarios</button></a> "
+    "<a href='/'><button>Inicio</button></a></div>"));
 }
 
 void handleResincronizarHistorico() {
@@ -1875,18 +2071,25 @@ void handleConfig() {
   if (emailEstado.startsWith("Enviado")) emailColor = "#28a745";
   else if (emailEstado.startsWith("Error")) emailColor = "#dc3545";
 
-  // Info de diagnostico: si HOY corresponde a un dia de limpieza (10, 20 o
-  // ultimo del mes). El envio automatico es diario; el borrado de memoria
-  // solo ocurre esos tres dias tras un envio exitoso — ver el envio manual
+  // Info de diagnostico: si HOY corresponde a un dia de limpieza (dias
+  // pares: 2, 4, 6, ... 30). El envio automatico es diario; el borrado de
+  // memoria solo ocurre esos dias tras un envio exitoso — el envio manual
   // ("Enviar por email" en /logs) NUNCA borra memoria, sin importar el dia.
   String diaLimpiezaStr = "RTC no disponible";
   if (rtcDisponible) {
     FechaHora fhCfg = rtcLeerFechaHora();
     int udCfg = ultimoDiaDelMes(fhCfg.mes, fhCfg.anio);
-    bool esDiaLimpiezaHoy = (fhCfg.dia == 10 || fhCfg.dia == 20 || fhCfg.dia == udCfg);
+    bool esDiaLimpiezaHoy = (fhCfg.dia % 2 == 0);
+    String proximoDiaStr;
+    if (!esDiaLimpiezaHoy) {
+      int proximoDia = fhCfg.dia + 1;
+      proximoDiaStr = (proximoDia <= udCfg)
+        ? ("dia " + String(proximoDia) + " de este mes")
+        : "dia 2 del proximo mes";
+    }
     diaLimpiezaStr = esDiaLimpiezaHoy
       ? "<span style='color:#28a745'>Si</span> (el proximo envio automatico exitoso hoy borrara la memoria)"
-      : "<span style='color:#666'>No</span> (proximo dia de limpieza: 10, 20 o " + String(udCfg) + " de este mes)";
+      : "<span style='color:#666'>No</span> (proximo dia de limpieza: " + proximoDiaStr + ")";
   }
 
   servidor.send(200, "text/html", pagina("Configuracion",
@@ -1907,8 +2110,8 @@ void handleConfig() {
     "<p class='muted'>Ultimo envio automatico de correo: " + ultimoEmail + "</p>"
     "<p class='muted'>&#191;Hoy es dia de limpieza (se borra la memoria tras el envio)? " + diaLimpiezaStr + "</p>"
     "<p class='muted'>Reportes automaticos diarios a medianoche "
-    "(reintento al mediodia si falla). La memoria se borra solo los dias 10, 20 y ultimo "
-    "del mes, despues de verificar el envio. Si ambos intentos fallan, aparece alerta en la web. "
+    "(reintento al mediodia si falla). La memoria se borra los dias pares del mes (2, 4, 6...), "
+    "despues de verificar el envio. Si ambos intentos fallan, aparece alerta en la web. "
     "El envio manual (boton \"Enviar por email\" en /logs o /entradas) NUNCA borra memoria, sin importar el dia.</p>"
     "</div>"
 
@@ -2212,6 +2415,9 @@ void setup() {
   servidor.on("/clearRegistros",   handleClearRegistros);
   servidor.on("/usuarios",         handleUsuarios);
   servidor.on("/downloadUsuarios", handleDownloadUsuarios);
+  servidor.on("/borrarTodosUsuarios", handleBorrarTodosUsuarios);
+  servidor.on("/importarUsuarios", HTTP_GET,  handleImportarUsuariosForm);
+  servidor.on("/importarUsuarios", HTTP_POST, handleImportarUsuarios);
   servidor.on("/resincronizarHistorico", handleResincronizarHistorico);
   servidor.on("/config",           handleConfig);
   servidor.on("/saveConfig",       HTTP_POST, handleSaveConfig);

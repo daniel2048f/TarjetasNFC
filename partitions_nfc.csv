@@ -1,0 +1,32 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Tabla a medida para este proyecto (chip de 4 MB).
+#
+# IDENTICA a min_spiffs.csv en nvs/otadata/app0 — esos offsets NO se pueden
+# mover. PlatformIO escribe el firmware en una direccion FIJA (0x10000):
+#   platforms/espressif32/builder/main.py:
+#     ESP32_APP_OFFSET = board.get("upload.offset_address", "0x10000")
+# y el board esp32dev no define "upload.offset_address". Un intento previo
+# movio app0 a 0x20000 para agrandar nvs: el firmware igual se escribio en
+# 0x10000, el bootloader lo busco en 0x20000 (flash borrada), no encontro
+# aplicacion valida y el ESP32 quedo en bucle de reinicio mostrando solo
+# "rst:0x3 (SW_RESET)" sin una sola linea de la aplicacion.
+#
+# Lo unico que SI se puede reclamar sin mover nada es app1 (~1.9 MB), el
+# segundo slot OTA que este proyecto nunca usa (no hay Update.h, ArduinoOTA
+# ni esp_ota_* en el codigo). Ese espacio pasa integro a spiffs/LittleFS.
+#
+# spiffs: 128 KB -> 2 MB (16x) para logs.txt/entradas.txt. Motivo: con
+#         128 KB, meses de historial sin limpiar llenaron el disco y un
+#         LittleFS lleno crashea internamente al escribir (division por
+#         cero en lfs_alloc) en vez de devolver un error controlado.
+# nvs:    se queda en 20 KB — no se puede agrandar sin mover otadata/app0.
+#
+# Cambiar de tabla exige borrar el chip por completo (--target erase): los
+# offsets de spiffs cambian y los datos viejos quedan donde ya no van. Los
+# usuarios se respaldan con /downloadUsuarios ANTES y se restauran con
+# /importarUsuarios DESPUES, sin volver a acercar cada tarjeta.
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x1E0000,
+spiffs,   data, spiffs,  0x1F0000,0x200000,
+coredump, data, coredump,0x3F0000,0x10000,

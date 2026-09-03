@@ -129,9 +129,32 @@ Las siguientes librerías son parte del framework Arduino para ESP32 y **no** re
 
 `WiFi`, `WebServer`, `Preferences`, `Wire`, `LittleFS`
 
-> El proyecto usa la partición `min_spiffs.csv` para maximizar el espacio disponible para LittleFS. Esta partición viene incluida en el framework de ESP32 para PlatformIO.
+> El proyecto usa la partición a medida [`partitions_nfc.csv`](partitions_nfc.csv) (ver [Partición de almacenamiento](#partición-de-almacenamiento) más abajo) para darle más espacio a LittleFS y a NVS que el que trae por defecto el framework de ESP32.
 >
 > El `build_flags = -DNFC_INTERFACE_HSU` en [platformio.ini](platformio.ini) le indica a la librería PN532 que se comunique por UART (HSU) en vez de I2C. No quitar este flag: sin él, la librería intenta hablar por I2C con el chip y la lectura de tarjetas falla.
+
+### Partición de almacenamiento
+
+El chip tiene 4 MB de flash. Como el proyecto **no usa actualización OTA** (no hay `Update.h`, `ArduinoOTA` ni `esp_ota_*` en el código), el segundo slot de aplicación que trae la partición estándar de PlatformIO queda completamente desperdiciado — casi 1.9 MB sin usar. [`partitions_nfc.csv`](partitions_nfc.csv) elimina ese slot no usado y reparte el espacio así:
+
+| Partición | Antes (`min_spiffs.csv`) | Ahora (`partitions_nfc.csv`) |
+| --------- | ------------------------- | ------------------------------ |
+| NVS (usuarios, contadores, config) | 20 KB | 20 KB (sin cambios — ver nota) |
+| App (firmware) | 1.9 MB (+ slot OTA extra sin usar) | 1.9 MB (igual, sin el slot sobrante) |
+| LittleFS (`/logs.txt`, `/entradas.txt`) | 128 KB | **2 MB** (16×) |
+
+> **Por qué NVS no se agranda:** PlatformIO escribe el firmware en una dirección **fija** (`0x10000`, ver `ESP32_APP_OFFSET` en `platforms/espressif32/builder/main.py`), así que `app0` tiene que empezar exactamente ahí — y eso a su vez fija los offsets de `nvs` (`0x9000`) y `otadata` (`0xe000`) antes de él. Un intento previo movió `app0` a `0x20000` para agrandar NVS: el firmware igual se escribió en `0x10000`, el bootloader lo buscó en `0x20000` (flash borrada), no encontró aplicación válida y el ESP32 quedó en bucle de reinicio mostrando solo `rst:0x3 (SW_RESET)`, sin una sola línea de la aplicación. Lo único reclamable sin mover nada es el slot `app1`, que va íntegro a LittleFS.
+
+Esto existe porque, en producción, meses de historial sin limpiar llenaron los 128 KB originales por completo — y un LittleFS completamente lleno puede hacer que el propio sistema de archivos falle internamente al escribir (en vez de devolver un error controlado), lo cual llegó a tumbar el ESP32 en un reinicio en bucle. El firmware ya tiene resguardos para que eso no vuelva a crashear aunque el disco se llene (ver [Solución de problemas](#solución-de-problemas)), pero con ~15× más espacio y el borrado automático cada 2 días, llegar a ese límite es mucho más difícil.
+
+> **Cambiar de tabla de particiones exige borrar el chip por completo** — los usuarios registrados y el historial que ya haya en el dispositivo se pierden en el borrado, porque NVS/LittleFS quedan en offsets de flash distintos a los de antes. Para migrar sin perder los usuarios ya registrados:
+>
+> 1. Con el firmware **actual** (antes de actualizar), entrar a `/usuarios` → **"Descargar CSV"** y guardar el archivo.
+> 2. Borrar el chip por completo: `platformio run --environment esp32dev --target erase` (o `esptool.py erase_flash`).
+> 3. Subir el firmware nuevo (ya con `partitions_nfc.csv`): `platformio run --environment esp32dev --target upload`.
+> 4. Entrar a `/usuarios` → **"📥 Importar usuarios"**, pegar el contenido del CSV guardado en el paso 1 y confirmar. Restaura todos los usuarios **sin volver a acercar cada tarjeta física** al lector.
+>
+> Los logs/entradas viejos (ya borrados en este incidente) no se pueden migrar de la misma forma; si hicieran falta a futuro, descargar sus CSV (`/downloadLogs`, `/downloadEntradas`) *antes* de borrar el chip.
 
 ### Pasos de instalación
 
@@ -220,6 +243,9 @@ Todas las rutas son accesibles desde `http://192.168.4.1`.
 | `/clearRegistros`   | GET    | Borra todos los registros (logs + entradas/salidas) y resetea contadores   |
 | `/usuarios`         | GET    | Lista de todos los usuarios registrados                                    |
 | `/downloadUsuarios` | GET    | Descarga la lista de usuarios en formato CSV                               |
+| `/borrarTodosUsuarios` | GET | Borra TODAS las tarjetas registradas, sin necesidad de acercarlas          |
+| `/importarUsuarios` | GET    | Formulario para pegar un CSV y registrar varios usuarios sin tarjeta física |
+| `/importarUsuarios` | POST   | Procesa el CSV pegado y registra cada usuario válido                       |
 | `/resincronizarHistorico` | GET | Reescribe logs.txt/entradas.txt con el nombre/código actual de cada tarjeta |
 | `/config`           | GET    | Página de configuración (WiFi, email, zona horaria)                        |
 | `/saveConfig`       | POST   | Guarda la configuración y reconecta el WiFi                                |
@@ -249,6 +275,15 @@ Todas las rutas son accesibles desde `http://192.168.4.1`.
 4. Si la tarjeta no está registrada, la web informa "Tarjeta no registrada".
 
 > Borrar una tarjeta también **elimina su contador de Entrada/Salida**, así que si se vuelve a usar (ahora sin registrar) o se registra de nuevo más adelante, arranca otra vez desde cero y el próximo toque vuelve a ser Entrada. Además, todas sus líneas viejas en `/logs` y `/entradas` vuelven a mostrar `NO_REGISTRADO` sin código — los eventos en sí (fecha, tipo) no se borran, solo el nombre/código que mostraban.
+
+### Borrado e importación masiva de usuarios (sin acercar tarjetas)
+
+Además del borrado de a una tarjeta (acercándola al lector), `/usuarios` tiene dos operaciones masivas que **no requieren tener las tarjetas físicas a mano**:
+
+- **📥 Importar usuarios**: pega el contenido de un CSV con el formato `UID,Nombre,Codigo` (el mismo que exporta "Descargar CSV") y registra a todos los usuarios válidos de una sola vez. Sirve sobre todo para restaurar usuarios después de un borrado completo del chip (ver [Partición de almacenamiento](#partición-de-almacenamiento)). Líneas con UID, nombre o código inválido se omiten y se informan al final; no interrumpen el resto de la importación.
+- **🗑️ Borrar TODAS las tarjetas**: elimina de una vez todos los usuarios registrados actualmente, con una confirmación explícita antes de ejecutar (no se puede deshacer). Igual que el borrado individual, el historial de `/logs`/`/entradas` de cada uno vuelve a mostrar `NO_REGISTRADO`.
+
+Ambas operaciones actualizan el historial en una sola pasada al final (no una vez por usuario), así que no se vuelven más lentas cuantos más usuarios haya.
 
 ---
 
@@ -336,7 +371,7 @@ Esta información permite detectar correctamente si hubo una Entrada sin Salida 
 
 ### Cuándo se envía
 
-El sistema envía automáticamente un correo **todos los días**, no solo los días 10, 20 y último del mes. Esos tres días son especiales únicamente porque, además de enviar, **también borran los archivos de historial** después del envío exitoso (ver [Qué ocurre después del envío automático](#qué-ocurre-después-del-envío-automático)). El resto de los días el correo se envía igual, pero los archivos se conservan y se van acumulando.
+El sistema envía automáticamente un correo **todos los días**, no solo los días pares. Los días **pares del mes (2, 4, 6, 8... 30)** son especiales únicamente porque, además de enviar, **también borran los archivos de historial** después del envío exitoso (ver [Qué ocurre después del envío automático](#qué-ocurre-después-del-envío-automático)). Los días impares el correo se envía igual, pero los archivos se conservan y se van acumulando hasta el próximo día par.
 
 Hay dos ventanas de envío por día:
 
@@ -355,7 +390,7 @@ El correo solo se envía si:
 
 **Si el ESP32 estuvo apagado un día entero** (o más) y arranca después, el sistema detecta el envío perdido comparando `lastEmail` con el día anterior (recordá que el envío es diario, no solo los días 10/20/último) y activa la alerta de reporte pendiente si hay datos en los archivos de registro.
 
-**Primera instalación:** En el primer arranque con código nuevo, el sistema registra la fecha de compilación como punto de partida para evitar falsos positivos. El primer envío automático real ocurrirá al día siguiente de la instalación (no hay que esperar a un día 10, 20 o último del mes para que empiece a mandar correos; esos días solo determinan cuándo se borran los archivos).
+**Primera instalación:** En el primer arranque con código nuevo, el sistema registra la fecha de compilación como punto de partida para evitar falsos positivos. El primer envío automático real ocurrirá al día siguiente de la instalación (no hay que esperar a un día par para que empiece a mandar correos; los días pares solo determinan cuándo se borran los archivos).
 
 ### Contenido del correo
 
@@ -369,7 +404,9 @@ El sufijo ` - N` es un contador de correos enviados en el día (empieza en 1 y s
 
 ### Qué ocurre después del envío automático
 
-El envío automático diario **no borra nada por sí solo**. El borrado solo ocurre cuando se cumplen dos condiciones a la vez: el envío fue exitoso **y** el día es 10, 20 o el último del mes. En ese caso, el sistema **borra ambos archivos de registro** (`/logs.txt` y `/entradas.txt`) y **resetea a 0 los contadores** de todas las tarjetas. La lista de usuarios (NVS) **no se borra**.
+El envío automático diario **no borra nada por sí solo**. El borrado solo ocurre cuando se cumplen dos condiciones a la vez: el envío fue exitoso **y** el día es par (2, 4, 6...30). En ese caso, el sistema **borra ambos archivos de registro** (`/logs.txt` y `/entradas.txt`) y **resetea a 0 los contadores** de todas las tarjetas. La lista de usuarios (NVS) **no se borra**.
+
+> **Por qué cada 2 días:** con la partición de LittleFS original (128 KB), meses de historial acumulado sin limpiar llegaron a llenar el disco por completo, lo cual provocaba un reinicio en bucle del sistema (ver [Solución de problemas](#solución-de-problemas)). Limpiar cada 2 días evita que eso vuelva a pasar, incluso si la partición ampliada (ver más abajo) no llegara a aplicarse.
 
 El resto de los días (envío exitoso pero no es día de limpieza), el correo se manda igual pero los archivos **se conservan** y siguen acumulando eventos hasta el próximo día de limpieza.
 

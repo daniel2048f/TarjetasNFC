@@ -52,10 +52,12 @@ Todo el código reside en un único archivo `src/main.cpp` (~2000 líneas). No h
 │  emailCnt   → int: correos enviados en emailCntDate  │
 └──────────────────────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────┐
-│ LittleFS (flash, partición min_spiffs)               │
+│ LittleFS (flash, partición partitions_nfc.csv)       │
 │  /logs.txt     → ts|uid|nombre|codigo                │
 │  /entradas.txt → ts|uid|nombre|codigo|tipo           │
 │  /uids.txt     → un UID hex por línea                │
+│  /logs.tmp, /entradas.tmp → temporales de reescritura│
+│  (actualizarNombreHistorico, resincronizarHistorico) │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -416,6 +418,14 @@ Este mecanismo de actualización recién se agregó; cualquier registro o borrad
 
 Se dispara automáticamente **una única vez**, en `setup()`, la primera vez que arranca un firmware que incluye este mecanismo (bandera `histSyncV1` en NVS — una vez puesta a `true`, nunca se vuelve a correr sola). También está expuesta a mano en `/resincronizarHistorico` (botón "🔄 Resincronizar nombres" en `/usuarios`) por si hace falta forzarla de nuevo más adelante.
 
+### Operaciones masivas de usuarios: mismo principio de "una sola pasada"
+
+`handleBorrarTodosUsuarios()` (`/borrarTodosUsuarios`) y `handleImportarUsuarios()` (`POST /importarUsuarios`) permiten borrar o registrar usuarios **sin acercar tarjetas físicas** — el primero recorre `ARCHIVO_UIDS` y elimina cada UID de NVS; el segundo parsea un CSV (`UID,Nombre,Codigo`, el mismo formato que exporta `usuariosCsv()`) y escribe cada línea válida directo en NVS + `uidRegistrar()`.
+
+Ambas funciones **procesan todos los usuarios primero y llaman a `resincronizarHistorico()` una sola vez al final**, no una vez por usuario. Llamar a `actualizarNombreHistorico()` (pensada para UN solo UID) dentro de un bucle por cada usuario reescribiría `logs.txt`/`entradas.txt` completos tantas veces como usuarios haya — exactamente el mismo patrón O(usuarios × tamaño de archivo) que causó el bug original de rendimiento en `resincronizarHistorico()`. Al reescribir una sola vez al final, el costo es O(tamaño de archivo) sin importar si se borran/importan 5 o 500 usuarios.
+
+`handleImportarUsuarios()` reutiliza exactamente la misma validación server-side que `handleSaveName()` (UID hexadecimal de 6–14 caracteres, nombre sin `|` ni `,`, código alfanumérico de 1–6 caracteres) para que un CSV con líneas corruptas no pueda dejar el sistema en un estado inconsistente — las líneas inválidas simplemente se omiten y se cuentan en el resumen final, sin interrumpir el resto de la importación.
+
 ---
 
 ## Secuencia de recuperación del UART del PN532
@@ -513,9 +523,38 @@ Este patrón permite que el servidor web sea completamente no bloqueante: ningú
 
 `limpiarRegistros()` siempre borra `ARCHIVO_LOG`, `ARCHIVO_ENT` **y** resetea todos los contadores NVS en una sola función. Si se borraran los archivos sin resetear los contadores, el sistema interpretaría que los usuarios con contador impar están "dentro" aunque no haya ningún registro que lo respalde. Si se resetearan los contadores sin borrar los archivos, los archivos mostrarían registros que el sistema ya no reconoce. La consistencia requiere que las tres acciones sean siempre conjuntas.
 
-### Partición `min_spiffs`
+### Partición `partitions_nfc.csv`
 
-El ESP32 divide su flash en particiones. La partición por defecto de Arduino reserva muy poco espacio para SPIFFS/LittleFS. `min_spiffs.csv` redistribuye el espacio dejando ~1.8 MB para LittleFS a costa de reducir el OTA partition. Dado que este proyecto no usa OTA, el intercambio es aceptable.
+El ESP32 divide su flash (4 MB en este chip) en particiones. El proyecto usaba originalmente `min_spiffs.csv` (una plantilla estándar del framework), que da 128 KB a LittleFS y 20 KB a NVS, reservando el resto para dos slots de aplicación (`app0`/`app1`) pensados para actualizaciones OTA.
+
+**Este proyecto nunca usa OTA** (no hay `Update.h`, `ArduinoOTA` ni `esp_ota_*` en el código), así que el segundo slot de aplicación (`app1`, ~1.9 MB) estaba completamente desperdiciado. En producción, meses de historial sin limpiar llenaron los 128 KB de LittleFS por completo — y un LittleFS lleno puede fallar internamente al escribir (crash dentro del propio asignador de bloques de la librería, `lfs_alloc`, en vez de devolver un error controlado), lo cual tumbó el ESP32 en un reinicio en bucle en cada arranque (`cerrarDiaArranque()` intentando escribir en un disco sin espacio).
+
+`partitions_nfc.csv` reemplaza el slot OTA sobrante por más espacio donde realmente hace falta:
+
+| Partición | `min_spiffs.csv` (antes) | `partitions_nfc.csv` (ahora) |
+|---|---|---|
+| `nvs`      | `0x9000`,  `0x5000`  (20 KB)             | **idéntica** (`0x9000`, `0x5000`) |
+| `otadata`  | `0xe000`,  `0x2000`                      | **idéntica** (`0xe000`, `0x2000`) |
+| `app0`     | `0x10000`, `0x1E0000` (subtipo `ota_0`)  | **idéntica** (`0x10000`, `0x1E0000`, `ota_0`) |
+| `app1`     | `0x1F0000`,`0x1E0000` (sin usar nunca)   | *(eliminada — su espacio va a spiffs)* |
+| `spiffs`   | `0x3D0000`,`0x20000`  (128 KB)           | `0x1F0000`, `0x200000` (**2 MB**) |
+| `coredump` | `0x3F0000`,`0x10000`                     | `0x3F0000`, `0x10000` (sin cambios — útil para decodificar crashes con `addr2line`, como el que motivó este cambio) |
+
+### Por qué `nvs`, `otadata` y `app0` no se pueden mover
+
+**PlatformIO escribe el firmware en una dirección fija.** En `platforms/espressif32/builder/main.py`:
+
+```python
+ESP32_APP_OFFSET = board.get("upload.offset_address", "0x10000")
+```
+
+El board `esp32dev` no define `upload.offset_address`, así que el binario **siempre** se graba en `0x10000`, sin importar lo que diga el CSV. Por lo tanto `app0` tiene que empezar exactamente en `0x10000`, y eso a su vez fija `nvs` (`0x9000`, 20 KB) y `otadata` (`0xe000`) que van antes.
+
+Dos intentos previos ignoraron esto y movieron `app0` a `0x20000` para agrandar NVS a 64 KB. Resultado en ambos casos: el firmware se grababa en `0x10000`, el bootloader lo buscaba en `0x20000` (flash borrada, sin imagen válida) y el ESP32 quedaba en **bucle de reinicio dentro del bootloader** — en el monitor serie solo se veía `rst:0x3 (SW_RESET)` repitiéndose, sin una sola línea de la aplicación. El primer intento se atribuyó erróneamente a haber quitado `otadata` y usado subtipo `factory`; el segundo los restauró y falló igual, lo que descartó esa hipótesis y dejó al descubierto la causa real: **el offset de `app0`**.
+
+La lección: en una tabla de particiones para PlatformIO, todo lo que esté en o antes de `app0` es intocable; lo único reclamable con seguridad es el espacio que quede *después* del slot de aplicación.
+
+**Migrar exige borrar el chip por completo** (los offsets de NVS/LittleFS cambian, así que sus datos previos quedan en offsets que ya no corresponden a nada válido). Ver [Partición de almacenamiento](../README.md#partición-de-almacenamiento) en el README para el procedimiento de respaldo/restauración de usuarios vía `/downloadUsuarios` + `/importarUsuarios` sin volver a acercar cada tarjeta física.
 
 ### Límite de 300 entradas mostradas en la web
 
@@ -610,7 +649,7 @@ flowchart TD
 
 ### 3. Cierre de día y correo automático (tarea de fondo cada 60 s)
 
-El envío de correo es **diario**, todos los días del mes — es un error común (¡y en el que cayó una versión anterior de este mismo documento!) pensar que solo se envía los días 10, 20 y último. Lo único que distingue a esos tres días es que, si el envío tiene éxito, además se borra el historial.
+El envío de correo es **diario**, todos los días del mes — es un error común (¡y en el que cayó una versión anterior de este mismo documento!) pensar que solo se envía los días de limpieza. Lo único que distingue a los días pares (2, 4, 6... 30) es que, si el envío tiene éxito, además se borra el historial.
 
 ```mermaid
 flowchart TD
@@ -623,7 +662,7 @@ flowchart TD
     W -- No --> W2{"¿Es medianoche o<br>mediodía, y hay internet?"}
     W2 -- No --> Y2["Espera a la próxima<br>ventana horaria"]
     W2 -- Sí --> X["Intenta enviar un correo* con<br>3 archivos adjuntos: accesos,<br>entradas/salidas y usuarios<br>(esto pasa TODOS LOS DÍAS)"]
-    X -- Éxito --> AB{"¿Hoy es día 10, 20<br>o el último del mes?"}
+    X -- Éxito --> AB{"¿Hoy es día par<br>(2, 4, 6... 30)?"}
     AB -- Sí --> Z["Borra los archivos de historial<br>y reinicia los contadores"]
     AB -- No --> AC["Los archivos NO se borran;<br>se acumulan para el próximo envío"]
     X -- "Falla, y ya pasó<br>la ventana del mediodía" --> AA["Muestra un aviso amarillo<br>en todas las páginas web"]
