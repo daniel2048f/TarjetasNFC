@@ -11,6 +11,7 @@
 #include <ESP_Mail_Client.h>
 #include <RTClib.h>
 #include "nvs.h"     // iterador NVS para reconstruir ARCHIVO_UIDS al arrancar
+#include "esp_task_wdt.h"  // alimentar el watchdog en operaciones largas (resync, logs/entradas)
 
 // ── Hardware ──────────────────────────────────────────────────
 // I2C: busRtc(SDA=19,SCL=18)→RTC DS3231 | Wire(SDA=21,SCL=22)→LCD(0x27)
@@ -81,6 +82,13 @@ bool          wifiConectadoPrev = false;
 String emailEstado        = "Sin intentos";
 String emailUltimoTs      = "";
 bool   emailPendienteFlag = false;  // true si ambas ventanas de auto-envio fallaron sin enviar
+
+// Freno de seguridad independiente de la fecha: pase lo que pase con el
+// guard de "lastEmail == hoy" (reinicios repetidos, RTC con lecturas
+// inestables, etc.), el sistema nunca debe intentar un envio automatico
+// mas de una vez dentro de esta ventana de tiempo real.
+unsigned long ultimoIntentoEmailAuto = 0;
+const unsigned long EMAIL_COOLDOWN_MS = 600000UL;  // minimo 10 min entre intentos automaticos
 
 // ── Timer LCD no bloqueante ───────────────────────────────────
 unsigned long tiempoLcdHasta = 0;
@@ -530,6 +538,10 @@ inline void refrescarPeriferia() {
   lcdActualizarParpadeo();
   ledActualizar();
   matrizActualizar();
+  esp_task_wdt_reset();  // yield() por si solo NO alimenta el task watchdog;
+                         // sin esto, una operacion larga (resync del historico
+                         // con miles de lineas) puede exceder su timeout y
+                         // reiniciar el ESP32 a mitad de camino.
   yield();
 }
 
@@ -796,7 +808,48 @@ void actualizarNombreHistorico(const String& uid, const String& nuevoNombre, con
 // automatica — por ejemplo, tarjetas registradas con un firmware anterior a
 // este cambio, cuyo historial viejo se quedo diciendo NO_REGISTRADO para
 // siempre porque esa version del firmware nunca lo corregia.
+// Busca "uid" en la cache precargada de usuarios (ver resincronizarHistorico);
+// si no esta, es que no esta registrado -> NO_REGISTRADO/sin codigo.
+static void resolverDeCache(const String* cacheUid, const String* cacheNombre,
+                            const String* cacheCodigo, int nCache, const String& uid,
+                            String& outNombre, String& outCodigo) {
+  for (int i = 0; i < nCache; i++) {
+    if (cacheUid[i] == uid) { outNombre = cacheNombre[i]; outCodigo = cacheCodigo[i]; return; }
+  }
+  outNombre = "NO_REGISTRADO";
+  outCodigo = "";
+}
+
 void resincronizarHistorico() {
+  // Precargar nombre/codigo de cada usuario registrado UNA sola vez en RAM,
+  // en vez de consultar NVS (memoria flash, con costo real por lectura) por
+  // cada linea del historial. Con miles de lineas acumuladas y solo unas
+  // decenas/cientos de usuarios, consultar NVS linea por linea multiplicaba
+  // el trabajo de forma innecesaria y podia tardar tanto que disparaba el
+  // watchdog del sistema durante el arranque — causa real de un reinicio en
+  // bucle mostrando "Sistema NFC / Iniciando..." detectado en produccion.
+  File fu = LittleFS.open(ARCHIVO_UIDS, "r");
+  int nUids = 0;
+  if (fu) { nUids = contarLineas(fu); fu.seek(0); }
+  String* cacheUid    = nUids ? new String[nUids] : nullptr;
+  String* cacheNombre = nUids ? new String[nUids] : nullptr;
+  String* cacheCodigo = nUids ? new String[nUids] : nullptr;
+  int nCache = 0;
+  if (fu) {
+    while (fu.available() && nCache < nUids) {
+      String uid = fu.readStringUntil('\n'); uid.trim();
+      refrescarPeriferia();
+      if (!uid.length()) continue;
+      String nombre = almacen.getString(uid.c_str(), "");
+      if (!nombre.length()) continue;
+      cacheUid[nCache]    = uid;
+      cacheNombre[nCache] = nombre;
+      cacheCodigo[nCache] = almacen.getString(("k" + uid).c_str(), "");
+      nCache++;
+    }
+    fu.close();
+  }
+
   File finLog = LittleFS.open(ARCHIVO_LOG, "r");
   if (finLog) {
     File foutLog = LittleFS.open(ARCHIVO_LOG_TMP, "w");
@@ -807,8 +860,8 @@ void resincronizarHistorico() {
         if (!l.length()) continue;
         String ts, u, nombre, codigo;
         if (logParsear(l, ts, u, nombre, codigo)) {
-          String nombreActual = almacen.getString(u.c_str(), "NO_REGISTRADO");
-          String codigoActual = (nombreActual == "NO_REGISTRADO") ? "" : almacen.getString(("k" + u).c_str(), "");
+          String nombreActual, codigoActual;
+          resolverDeCache(cacheUid, cacheNombre, cacheCodigo, nCache, u, nombreActual, codigoActual);
           foutLog.println(ts + "|" + u + "|" + nombreActual + "|" + codigoActual);
         } else {
           foutLog.println(l);
@@ -834,8 +887,8 @@ void resincronizarHistorico() {
         if (!l.length()) continue;
         String ts, u, nombre, codigo, tipo;
         if (entradaParsear(l, ts, u, nombre, codigo, tipo)) {
-          String nombreActual = almacen.getString(u.c_str(), "NO_REGISTRADO");
-          String codigoActual = (nombreActual == "NO_REGISTRADO") ? "" : almacen.getString(("k" + u).c_str(), "");
+          String nombreActual, codigoActual;
+          resolverDeCache(cacheUid, cacheNombre, cacheCodigo, nCache, u, nombreActual, codigoActual);
           foutEnt.println(ts + "|" + u + "|" + nombreActual + "|" + codigoActual + "|" + tipo);
         } else {
           foutEnt.println(l);
@@ -850,7 +903,8 @@ void resincronizarHistorico() {
       finEnt.close();
     }
   }
-  Serial.println("RESYNC: historico de logs.txt/entradas.txt resincronizado con NVS");
+  delete[] cacheUid; delete[] cacheNombre; delete[] cacheCodigo;
+  Serial.println("RESYNC: historico resincronizado con NVS (" + String(nCache) + " usuarios en cache)");
 }
 
 // ── Usuarios (ARCHIVO_UIDS + NVS) ────────────────────────────
@@ -1355,6 +1409,9 @@ void autoEnviarEmail() {
 
   if (fh.hora == 0 || fh.hora == 12) {
     if (WiFi.status() != WL_CONNECTED) return;
+    unsigned long ahoraMs = millis();
+    if (ultimoIntentoEmailAuto && ahoraMs - ultimoIntentoEmailAuto < EMAIL_COOLDOWN_MS) return;
+    ultimoIntentoEmailAuto = ahoraMs;
     Serial.printf("AUTO-EMAIL: ventana hora %d, dia=%d (dia de limpieza=%s), generando CSV...\n",
                   fh.hora, fh.dia, esDiaLimpieza ? "SI" : "NO");
     bool ok = enviarEmail(logCsv(), entradaCsv(), esDiaLimpieza, true);
@@ -2093,9 +2150,16 @@ void setup() {
   // vez que arranca este firmware (bandera en NVS); despues el registro y
   // el borrado mantienen todo sincronizado por su cuenta.
   if (!almacen.getBool("histSyncV1", false)) {
+    // La bandera se marca ANTES de correr, no despues: si por lo que sea el
+    // resync tardara mas de lo esperado y el sistema se reiniciara a mitad
+    // de camino, NO debe repetir el intento en cada arranque siguiente (eso
+    // produciria un reinicio en bucle infinito). Peor es un resync que quedo
+    // incompleto una sola vez (corregible a mano desde /resincronizarHistorico
+    // o desde el boton en /usuarios) que un dispositivo que nunca termina de
+    // arrancar.
+    almacen.putBool("histSyncV1", true);
     Serial.println("RESYNC: primera vez con esta version, resincronizando historico...");
     resincronizarHistorico();
-    almacen.putBool("histSyncV1", true);
   }
 
   // ── RTC ──────────────────────────────────────────────────────────────────────
